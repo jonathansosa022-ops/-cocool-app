@@ -238,6 +238,10 @@ function DataProvider({ children }) {
     setMovimientos((prev) => prev.filter((m) => m.compra_id !== id));
   };
 
+  // Registra una venta (posiblemente con varios productos en el carrito).
+  // Cada línea del carrito genera su propia venta Y su propio movimiento de
+  // caja o cuenta por cobrar, vinculado por venta_id — así cada venta se puede
+  // editar o eliminar de forma independiente sin desordenar la contabilidad.
   const registrarVentaCarrito = ({ canal, items, metodoPago, contactoId, fechaVencimiento, fecha }) => {
     const fechaVenta = fecha || todayISO();
     let totalVenta = 0;
@@ -251,10 +255,8 @@ function DataProvider({ children }) {
       const costo = prod.costo_variable * item.cantidad;
       totalVenta += total;
       lineas.push({
-        fecha: fechaVenta, canal, producto_id: item.producto_id, cantidad: item.cantidad,
+        producto_id: item.producto_id, nombreProd: prod.nombre, cantidad: item.cantidad,
         precio_unitario: precioUnit, total, costo_total: costo, margen: total - costo,
-        metodo_pago: metodoPago, contacto_id: contactoId || null,
-        estado_cobro: metodoPago === 'Crédito' ? 'Pendiente' : 'Cobrado',
       });
     });
 
@@ -265,27 +267,96 @@ function DataProvider({ children }) {
       })
     );
 
-    setVentas((prev) => {
-      let id = nextId(prev);
-      return [...prev, ...lineas.map((v) => ({ ...v, id: id++ }))];
+    let ventaId = nextId(ventas);
+    let cxcId = nextId(cuentasCobrar);
+    let movId = nextId(movimientos);
+    const nuevasVentas = [];
+    const nuevasCxc = [];
+    const nuevosMov = [];
+
+    lineas.forEach((l) => {
+      const id = ventaId++;
+      nuevasVentas.push({
+        id, fecha: fechaVenta, canal, producto_id: l.producto_id, cantidad: l.cantidad,
+        precio_unitario: l.precio_unitario, total: l.total, costo_total: l.costo_total, margen: l.margen,
+        metodo_pago: metodoPago, contacto_id: contactoId || null,
+        estado_cobro: metodoPago === 'Crédito' ? 'Pendiente' : 'Cobrado',
+      });
+      if (metodoPago === 'Crédito') {
+        nuevasCxc.push({
+          id: cxcId++, venta_id: id, contacto_id: contactoId, monto_total: l.total, monto_pagado: 0,
+          estado: 'Pendiente', fecha_vencimiento: fechaVencimiento, canal, fecha: fechaVenta,
+        });
+      } else {
+        nuevosMov.push({
+          id: movId++, venta_id: id, fecha: fechaVenta, tipo: 'Ingreso', categoria: 'Venta',
+          monto: l.total, descripcion: `Venta ${canal} - ${l.nombreProd} x${l.cantidad} (${metodoPago})`,
+        });
+      }
     });
 
-    if (metodoPago === 'Crédito') {
-      setCuentasCobrar((prev) => [
-        ...prev,
-        { id: nextId(prev), contacto_id: contactoId, monto_total: totalVenta, monto_pagado: 0, estado: 'Pendiente', fecha_vencimiento: fechaVencimiento, canal, fecha: fechaVenta },
-      ]);
-    } else {
-      setMovimientos((prev) => [
-        ...prev,
-        { id: nextId(prev), fecha: fechaVenta, tipo: 'Ingreso', categoria: 'Venta', monto: totalVenta, descripcion: `Venta ${canal} - ${items.length} producto(s) (${metodoPago})` },
-      ]);
-    }
+    setVentas((prev) => [...prev, ...nuevasVentas]);
+    if (nuevasCxc.length) setCuentasCobrar((prev) => [...prev, ...nuevasCxc]);
+    if (nuevosMov.length) setMovimientos((prev) => [...prev, ...nuevosMov]);
 
     return totalVenta;
   };
 
+  // Edita una venta ya cargada: fecha, canal, producto y cantidad recalculan
+  // precio/total/margen y ajustan el stock por la diferencia. El método de
+  // pago no se toca acá (ver nota en la UI) para no tener que migrar entre un
+  // ingreso de caja y una cuenta por cobrar.
+  const updateVenta = (id, patch) => {
+    const old = ventas.find((v) => v.id === id);
+    if (!old) return;
+    const merged = { ...old, ...patch };
+    const prod = productos.find((p) => p.id === merged.producto_id);
+    if (prod) {
+      merged.precio_unitario = merged.canal === 'B2B' ? prod.precio_b2b : prod.precio_b2c;
+      merged.total = merged.precio_unitario * merged.cantidad;
+      merged.costo_total = prod.costo_variable * merged.cantidad;
+      merged.margen = merged.total - merged.costo_total;
+    }
+
+    setVentas((prev) => prev.map((v) => (v.id === id ? merged : v)));
+
+    setProductos((prev) =>
+      prev.map((p) => {
+        let stock = p.stock;
+        if (p.id === old.producto_id) stock -= old.cantidad;
+        if (p.id === merged.producto_id) stock += merged.cantidad;
+        return stock !== p.stock ? { ...p, stock: Math.max(0, stock) } : p;
+      })
+    );
+
+    setMovimientos((prev) =>
+      prev.map((m) => (m.venta_id === id ? { ...m, fecha: merged.fecha, monto: merged.total } : m))
+    );
+    setCuentasCobrar((prev) =>
+      prev.map((c) => (c.venta_id === id ? { ...c, fecha: merged.fecha, canal: merged.canal, monto_total: merged.total } : c))
+    );
+  };
+
+  // Elimina una venta: revierte el stock y borra el ingreso o la cuenta por
+  // cobrar vinculada.
+  const deleteVenta = (id) => {
+    const old = ventas.find((v) => v.id === id);
+    if (!old) return;
+    setVentas((prev) => prev.filter((v) => v.id !== id));
+    setProductos((prev) =>
+      prev.map((p) => (p.id === old.producto_id ? { ...p, stock: p.stock + old.cantidad } : p))
+    );
+    setMovimientos((prev) => prev.filter((m) => m.venta_id !== id));
+    setCuentasCobrar((prev) => prev.filter((c) => c.venta_id !== id));
+  };
+
   const addMovimiento = (m) => setMovimientos((prev) => [...prev, { ...m, id: nextId(prev) }]);
+
+  // Solo se usan desde la UI para movimientos cargados a mano (sin venta_id
+  // ni compra_id) — los generados automáticamente se editan desde su origen.
+  const updateMovimiento = (id, patch) =>
+    setMovimientos((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
+  const deleteMovimiento = (id) => setMovimientos((prev) => prev.filter((m) => m.id !== id));
 
   const marcarCobrado = (cxc) => {
     const saldo = cxc.monto_total - cxc.monto_pagado;
@@ -293,11 +364,19 @@ function DataProvider({ children }) {
     addMovimiento({ fecha: todayISO(), tipo: 'Ingreso', categoria: 'Cobro CxC', monto: saldo, descripcion: `Cobro de ${nombreContacto(cxc.contacto_id)}` });
   };
 
+  const updateCuentaCobrar = (id, patch) =>
+    setCuentasCobrar((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+  const deleteCuentaCobrar = (id) => setCuentasCobrar((prev) => prev.filter((c) => c.id !== id));
+
   const marcarPagado = (cxp) => {
     const saldo = cxp.monto_total - cxp.monto_pagado;
     setCuentasPagar((prev) => prev.map((c) => (c.id === cxp.id ? { ...c, estado: 'Pagado', monto_pagado: c.monto_total } : c)));
     addMovimiento({ fecha: todayISO(), tipo: 'Egreso', categoria: 'Pago CxP', monto: saldo, descripcion: `Pago a ${cxp.acreedor}` });
   };
+
+  const updateCuentaPagar = (id, patch) =>
+    setCuentasPagar((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+  const deleteCuentaPagar = (id) => setCuentasPagar((prev) => prev.filter((c) => c.id !== id));
 
   const addCuentaPagar = (c) => setCuentasPagar((prev) => [...prev, { ...c, id: nextId(prev), monto_pagado: 0, estado: 'Pendiente' }]);
 
@@ -316,9 +395,12 @@ function DataProvider({ children }) {
 
   const value = {
     productos, contactos, ventas, compras, movimientos, cuentasCobrar, cuentasPagar, config,
-    nombreContacto, updateProducto, addProducto, deleteProducto, registrarVentaCarrito, addMovimiento,
+    nombreContacto, updateProducto, addProducto, deleteProducto, registrarVentaCarrito, updateVenta, deleteVenta,
+    addMovimiento, updateMovimiento, deleteMovimiento,
     addContacto, updateContacto, deleteContacto, registrarCompra, updateCompra, deleteCompra,
-    marcarCobrado, marcarPagado, addCuentaPagar, updateConfig, importState,
+    marcarCobrado, updateCuentaCobrar, deleteCuentaCobrar,
+    marcarPagado, addCuentaPagar, updateCuentaPagar, deleteCuentaPagar,
+    updateConfig, importState,
   };
 
   if (!listo) {
@@ -1011,6 +1093,101 @@ function POSPage() {
           )}
         </Card>
       </div>
+
+      <HistorialVentasTab />
+    </div>
+  );
+}
+
+function HistorialVentasTab() {
+  const { ventas, productos, updateVenta, deleteVenta } = useData();
+
+  const mesesDisponibles = useMemo(() => {
+    const set = new Set(ventas.map((v) => v.fecha.slice(0, 7)));
+    return Array.from(set).sort().reverse();
+  }, [ventas]);
+
+  const mesActual = monthKey(new Date());
+  const [mesFiltro, setMesFiltro] = useState(mesesDisponibles.includes(mesActual) ? mesActual : 'Todos');
+
+  const filtradas = ventas
+    .filter((v) => mesFiltro === 'Todos' || v.fecha.slice(0, 7) === mesFiltro)
+    .sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+
+  const totalVentas = filtradas.reduce((s, v) => s + v.total, 0);
+
+  return (
+    <div className="space-y-3 pt-2">
+      <h3 className="text-sm font-semibold text-slate-700">Historial de Ventas</h3>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <CalendarRange size={15} className="text-slate-400" />
+          <select className={inputCls} value={mesFiltro} onChange={(e) => setMesFiltro(e.target.value)}>
+            <option value="Todos">Todos los meses</option>
+            {mesesDisponibles.map((mk) => <option key={mk} value={mk}>{formatMesLabel(mk)}</option>)}
+          </select>
+        </div>
+        <div className="flex gap-4 text-sm">
+          <span className="text-slate-500">Ventas: <b className="text-slate-800 tabular-nums">{filtradas.length}</b></span>
+          <span className="text-slate-500">Total: <b className="text-emerald-700 tabular-nums">{formatGs(totalVentas)}</b></span>
+        </div>
+      </div>
+      <p className="text-xs text-slate-400">
+        Editá fecha, canal, producto o cantidad directamente. El método de pago no se edita acá — si te equivocaste, eliminá la venta y cargala de nuevo.
+      </p>
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
+            <tr>
+              <th className="text-left px-4 py-2.5">Fecha</th>
+              <th className="text-left px-4 py-2.5">Canal</th>
+              <th className="text-left px-4 py-2.5">Producto</th>
+              <th className="text-right px-4 py-2.5">Cantidad</th>
+              <th className="text-right px-4 py-2.5">Total</th>
+              <th className="text-left px-4 py-2.5">Pago</th>
+              <th className="px-4 py-2.5"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtradas.map((v) => (
+              <tr key={v.id} className="border-t border-slate-100">
+                <td className="px-4 py-2.5">
+                  <input type="date" className={inputTableText} value={v.fecha}
+                    onChange={(e) => updateVenta(v.id, { fecha: e.target.value })} />
+                </td>
+                <td className="px-4 py-2.5">
+                  <select className={`${inputTableText} min-w-[6.5rem]`} value={v.canal}
+                    onChange={(e) => updateVenta(v.id, { canal: e.target.value })}>
+                    {CANALES.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </td>
+                <td className="px-4 py-2.5">
+                  <select className={inputTableText} value={v.producto_id}
+                    onChange={(e) => updateVenta(v.id, { producto_id: Number(e.target.value) })}>
+                    {productos.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                  </select>
+                </td>
+                <td className="px-4 py-2.5 text-right">
+                  <input type="number" min="1" className={inputSm} value={v.cantidad}
+                    onChange={(e) => updateVenta(v.id, { cantidad: Number(e.target.value) })} />
+                </td>
+                <td className="px-4 py-2.5 text-right tabular-nums font-semibold">{formatGs(v.total)}</td>
+                <td className="px-4 py-2.5">
+                  <Badge tone={v.metodo_pago === 'Crédito' ? 'amber' : 'slate'}>{v.metodo_pago}</Badge>
+                </td>
+                <td className="px-4 py-2.5 text-right">
+                  <button onClick={() => deleteVenta(v.id)} title="Eliminar venta" className="text-slate-400 hover:text-rose-600">
+                    <Trash2 size={15} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {filtradas.length === 0 && (
+              <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">No hay ventas registradas en este período.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
     </div>
   );
 }
@@ -1305,15 +1482,35 @@ function NuevoMovimientoModal({ open, onClose }) {
 }
 
 function MovimientosTab() {
-  const { movimientos } = useData();
+  const { movimientos, updateMovimiento, deleteMovimiento } = useData();
   const [open, setOpen] = useState(false);
-  const ordenados = [...movimientos].sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
-  const ingresos = movimientos.filter((m) => m.tipo === 'Ingreso').reduce((s, m) => s + m.monto, 0);
-  const egresos = movimientos.filter((m) => m.tipo === 'Egreso').reduce((s, m) => s + m.monto, 0);
+
+  const mesesDisponibles = useMemo(() => {
+    const set = new Set(movimientos.map((m) => m.fecha.slice(0, 7)));
+    return Array.from(set).sort().reverse();
+  }, [movimientos]);
+
+  const mesActual = monthKey(new Date());
+  const [mesFiltro, setMesFiltro] = useState(mesesDisponibles.includes(mesActual) ? mesActual : 'Todos');
+
+  const filtrados = movimientos
+    .filter((m) => mesFiltro === 'Todos' || m.fecha.slice(0, 7) === mesFiltro)
+    .sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+
+  const ingresos = filtrados.filter((m) => m.tipo === 'Ingreso').reduce((s, m) => s + m.monto, 0);
+  const egresos = filtrados.filter((m) => m.tipo === 'Egreso').reduce((s, m) => s + m.monto, 0);
+  const categoriasDe = (tipo) => (tipo === 'Ingreso' ? CATEGORIAS_INGRESO : CATEGORIAS_EGRESO);
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <CalendarRange size={15} className="text-slate-400" />
+          <select className={inputCls} value={mesFiltro} onChange={(e) => setMesFiltro(e.target.value)}>
+            <option value="Todos">Todos los meses</option>
+            {mesesDisponibles.map((mk) => <option key={mk} value={mk}>{formatMesLabel(mk)}</option>)}
+          </select>
+        </div>
         <div className="flex gap-4 text-sm">
           <span className="text-slate-500">Ingresos: <b className="text-emerald-700 tabular-nums">{formatGs(ingresos)}</b></span>
           <span className="text-slate-500">Egresos: <b className="text-rose-600 tabular-nums">{formatGs(egresos)}</b></span>
@@ -1321,6 +1518,9 @@ function MovimientosTab() {
         </div>
         <Button onClick={() => setOpen(true)}><Plus size={16} /> Nuevo movimiento</Button>
       </div>
+      <p className="text-xs text-slate-400">
+        Los movimientos marcados "Vinculado" los generó una venta o compra — se editan desde ahí, para no desordenar la contabilidad.
+      </p>
       <Card className="overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
@@ -1330,24 +1530,68 @@ function MovimientosTab() {
               <th className="text-left px-4 py-2.5">Categoría</th>
               <th className="text-left px-4 py-2.5">Descripción</th>
               <th className="text-right px-4 py-2.5">Monto</th>
+              <th className="px-4 py-2.5"></th>
             </tr>
           </thead>
           <tbody>
-            {ordenados.map((m) => (
-              <tr key={m.id} className="border-t border-slate-100">
-                <td className="px-4 py-2.5 text-slate-500">{m.fecha}</td>
-                <td className="px-4 py-2.5">
-                  <Badge tone={m.tipo === 'Ingreso' ? 'emerald' : 'rose'}>
-                    {m.tipo === 'Ingreso' ? <ArrowDownRight size={12} /> : <ArrowUpRight size={12} />} {m.tipo}
-                  </Badge>
-                </td>
-                <td className="px-4 py-2.5 text-slate-600">{m.categoria}</td>
-                <td className="px-4 py-2.5 text-slate-500">{m.descripcion || '—'}</td>
-                <td className={`px-4 py-2.5 text-right tabular-nums font-semibold ${m.tipo === 'Ingreso' ? 'text-emerald-700' : 'text-rose-600'}`}>
-                  {m.tipo === 'Ingreso' ? '+' : '-'}{formatGs(m.monto)}
-                </td>
-              </tr>
-            ))}
+            {filtrados.map((m) => {
+              const vinculado = Boolean(m.venta_id || m.compra_id);
+              return (
+                <tr key={m.id} className="border-t border-slate-100">
+                  <td className="px-4 py-2.5">
+                    {vinculado ? (
+                      <span className="text-slate-500">{m.fecha}</span>
+                    ) : (
+                      <input type="date" className={inputTableText} value={m.fecha}
+                        onChange={(e) => updateMovimiento(m.id, { fecha: e.target.value })} />
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <Badge tone={m.tipo === 'Ingreso' ? 'emerald' : 'rose'}>
+                      {m.tipo === 'Ingreso' ? <ArrowDownRight size={12} /> : <ArrowUpRight size={12} />} {m.tipo}
+                    </Badge>
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-600">
+                    {vinculado ? (
+                      m.categoria
+                    ) : (
+                      <select className={inputTableText} value={m.categoria}
+                        onChange={(e) => updateMovimiento(m.id, { categoria: e.target.value })}>
+                        {categoriasDe(m.tipo).map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-500">
+                    {vinculado ? (
+                      <span className="flex items-center gap-2">{m.descripcion || '—'} <Badge tone="slate">Vinculado</Badge></span>
+                    ) : (
+                      <input className={inputTableText} value={m.descripcion || ''}
+                        onChange={(e) => updateMovimiento(m.id, { descripcion: e.target.value })} />
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5 text-right">
+                    {vinculado ? (
+                      <span className={`tabular-nums font-semibold ${m.tipo === 'Ingreso' ? 'text-emerald-700' : 'text-rose-600'}`}>
+                        {m.tipo === 'Ingreso' ? '+' : '-'}{formatGs(m.monto)}
+                      </span>
+                    ) : (
+                      <input type="number" className={inputSm} value={m.monto}
+                        onChange={(e) => updateMovimiento(m.id, { monto: Number(e.target.value) })} />
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5 text-right">
+                    {!vinculado && (
+                      <button onClick={() => deleteMovimiento(m.id)} title="Eliminar movimiento" className="text-slate-400 hover:text-rose-600">
+                        <Trash2 size={15} />
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+            {filtrados.length === 0 && (
+              <tr><td colSpan={6} className="px-4 py-8 text-center text-slate-400">No hay movimientos en este período.</td></tr>
+            )}
           </tbody>
         </table>
       </Card>
@@ -1357,7 +1601,7 @@ function MovimientosTab() {
 }
 
 function CuentasCobrarTab() {
-  const { cuentasCobrar, nombreContacto, marcarCobrado } = useData();
+  const { cuentasCobrar, nombreContacto, marcarCobrado, updateCuentaCobrar, deleteCuentaCobrar } = useData();
   const ordenadas = [...cuentasCobrar].sort((a, b) => (a.fecha_vencimiento > b.fecha_vencimiento ? 1 : -1));
   return (
     <Card className="overflow-hidden">
@@ -1375,21 +1619,41 @@ function CuentasCobrarTab() {
         <tbody>
           {ordenadas.map((c) => {
             const vencida = c.estado === 'Pendiente' && c.fecha_vencimiento < todayISO();
+            const bloqueada = c.estado === 'Pagado';
             return (
               <tr key={c.id} className="border-t border-slate-100">
                 <td className="px-4 py-2.5 font-medium text-slate-700">{nombreContacto(c.contacto_id)}</td>
                 <td className="px-4 py-2.5"><Badge tone={CANAL_TONE[c.canal] || 'slate'}>{c.canal}</Badge></td>
-                <td className={`px-4 py-2.5 ${vencida ? 'text-rose-600 font-medium' : 'text-slate-500'}`}>{c.fecha_vencimiento}</td>
-                <td className="px-4 py-2.5 text-right tabular-nums font-semibold">{formatGs(c.monto_total)}</td>
+                <td className="px-4 py-2.5">
+                  {bloqueada ? (
+                    <span className="text-slate-500">{c.fecha_vencimiento}</span>
+                  ) : (
+                    <input type="date" className={`${inputTableText} ${vencida ? 'text-rose-600 font-medium' : ''}`}
+                      value={c.fecha_vencimiento} onChange={(e) => updateCuentaCobrar(c.id, { fecha_vencimiento: e.target.value })} />
+                  )}
+                </td>
+                <td className="px-4 py-2.5 text-right">
+                  {bloqueada ? (
+                    <span className="tabular-nums font-semibold">{formatGs(c.monto_total)}</span>
+                  ) : (
+                    <input type="number" className={inputSm} value={c.monto_total}
+                      onChange={(e) => updateCuentaCobrar(c.id, { monto_total: Number(e.target.value) })} />
+                  )}
+                </td>
                 <td className="px-4 py-2.5">
                   <Badge tone={c.estado === 'Pagado' ? 'emerald' : vencida ? 'rose' : 'amber'}>
                     {c.estado === 'Pagado' ? <Check size={12} /> : <Clock size={12} />} {vencida ? 'Vencida' : c.estado}
                   </Badge>
                 </td>
                 <td className="px-4 py-2.5 text-right">
-                  {c.estado !== 'Pagado' && (
-                    <Button variant="secondary" onClick={() => marcarCobrado(c)}><CreditCard size={13} /> Marcar Cobrado</Button>
-                  )}
+                  <div className="flex items-center justify-end gap-2">
+                    {c.estado !== 'Pagado' && (
+                      <Button variant="secondary" onClick={() => marcarCobrado(c)}><CreditCard size={13} /> Marcar Cobrado</Button>
+                    )}
+                    <button onClick={() => deleteCuentaCobrar(c.id)} title="Eliminar" className="text-slate-400 hover:text-rose-600">
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
                 </td>
               </tr>
             );
@@ -1440,7 +1704,7 @@ function NuevaCuentaPagarModal({ open, onClose }) {
 }
 
 function CuentasPagarTab() {
-  const { cuentasPagar, marcarPagado } = useData();
+  const { cuentasPagar, marcarPagado, updateCuentaPagar, deleteCuentaPagar } = useData();
   const [open, setOpen] = useState(false);
   const ordenadas = [...cuentasPagar].sort((a, b) => (a.fecha_vencimiento > b.fecha_vencimiento ? 1 : -1));
 
@@ -1464,21 +1728,55 @@ function CuentasPagarTab() {
           <tbody>
             {ordenadas.map((c) => {
               const vencida = c.estado === 'Pendiente' && c.fecha_vencimiento < todayISO();
+              const bloqueada = c.estado === 'Pagado';
               return (
                 <tr key={c.id} className="border-t border-slate-100">
-                  <td className="px-4 py-2.5 font-medium text-slate-700">{c.acreedor}</td>
-                  <td className="px-4 py-2.5"><Badge tone={c.tipo === 'Préstamo' ? 'slate' : 'amber'}>{c.tipo}</Badge></td>
-                  <td className={`px-4 py-2.5 ${vencida ? 'text-rose-600 font-medium' : 'text-slate-500'}`}>{c.fecha_vencimiento}</td>
-                  <td className="px-4 py-2.5 text-right tabular-nums font-semibold">{formatGs(c.monto_total)}</td>
+                  <td className="px-4 py-2.5 font-medium text-slate-700">
+                    {bloqueada ? c.acreedor : (
+                      <input className={inputTableText} value={c.acreedor}
+                        onChange={(e) => updateCuentaPagar(c.id, { acreedor: e.target.value })} />
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {bloqueada ? (
+                      <Badge tone={c.tipo === 'Préstamo' ? 'slate' : 'amber'}>{c.tipo}</Badge>
+                    ) : (
+                      <select className={`${inputTableText} min-w-[7rem]`} value={c.tipo}
+                        onChange={(e) => updateCuentaPagar(c.id, { tipo: e.target.value })}>
+                        <option>Proveedor</option><option>Préstamo</option>
+                      </select>
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {bloqueada ? (
+                      <span className="text-slate-500">{c.fecha_vencimiento}</span>
+                    ) : (
+                      <input type="date" className={`${inputTableText} ${vencida ? 'text-rose-600 font-medium' : ''}`}
+                        value={c.fecha_vencimiento} onChange={(e) => updateCuentaPagar(c.id, { fecha_vencimiento: e.target.value })} />
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5 text-right">
+                    {bloqueada ? (
+                      <span className="tabular-nums font-semibold">{formatGs(c.monto_total)}</span>
+                    ) : (
+                      <input type="number" className={inputSm} value={c.monto_total}
+                        onChange={(e) => updateCuentaPagar(c.id, { monto_total: Number(e.target.value) })} />
+                    )}
+                  </td>
                   <td className="px-4 py-2.5">
                     <Badge tone={c.estado === 'Pagado' ? 'emerald' : vencida ? 'rose' : 'amber'}>
                       {c.estado === 'Pagado' ? <Check size={12} /> : <Clock size={12} />} {vencida ? 'Vencida' : c.estado}
                     </Badge>
                   </td>
                   <td className="px-4 py-2.5 text-right">
-                    {c.estado !== 'Pagado' && (
-                      <Button variant="secondary" onClick={() => marcarPagado(c)}><CreditCard size={13} /> Marcar Pagado</Button>
-                    )}
+                    <div className="flex items-center justify-end gap-2">
+                      {c.estado !== 'Pagado' && (
+                        <Button variant="secondary" onClick={() => marcarPagado(c)}><CreditCard size={13} /> Marcar Pagado</Button>
+                      )}
+                      <button onClick={() => deleteCuentaPagar(c.id)} title="Eliminar" className="text-slate-400 hover:text-rose-600">
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );

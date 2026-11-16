@@ -6,7 +6,7 @@ import {
   Truck, PackagePlus,
 } from 'lucide-react';
 import {
-  ResponsiveContainer, BarChart, Bar, LineChart, Line, AreaChart, Area,
+  ResponsiveContainer, BarChart, Bar, LineChart, Line, AreaChart, Area, ComposedChart,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts';
 import { doc, onSnapshot, setDoc } from 'firebase/firestore';
@@ -46,6 +46,74 @@ const daysInMonth = (d = new Date()) => new Date(d.getFullYear(), d.getMonth() +
 const nextId = (arr) => (arr.length ? Math.max(...arr.map((x) => x.id)) + 1 : 1);
 const clampPct = (n) => Math.min(100, Math.max(0, n));
 const mesLabelCorto = (mk) => new Date(`${mk}-02`).toLocaleDateString('es-PY', { month: 'short', year: '2-digit' });
+
+// --- Helpers de rangos de fecha (todo en formato ISO 'YYYY-MM-DD', en hora local) ---
+const toISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const addDays = (iso, n) => { const d = new Date(`${iso}T00:00:00`); d.setDate(d.getDate() + n); return toISO(d); };
+const enRango = (fecha, desde, hasta) => (!desde || fecha >= desde) && (!hasta || fecha <= hasta);
+const diaSemanaLabel = (iso) => {
+  const label = new Date(`${iso}T00:00:00`).toLocaleDateString('es-PY', { weekday: 'short', day: 'numeric', month: 'short' });
+  return label.charAt(0).toUpperCase() + label.slice(1);
+};
+const fechaLarga = (iso) => new Date(`${iso}T00:00:00`).toLocaleDateString('es-PY', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+const DIAS_SEMANA = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+
+// Calcula el rango (desde, hasta) para cada preset del selector de fechas.
+// La semana arranca el lunes, como se usa en Paraguay.
+const rangoPreset = (preset, base = new Date()) => {
+  const hoy = toISO(base);
+  const y = base.getFullYear();
+  const m = String(base.getMonth() + 1).padStart(2, '0');
+  switch (preset) {
+    case 'hoy': return { desde: hoy, hasta: hoy };
+    case 'ayer': { const a = addDays(hoy, -1); return { desde: a, hasta: a }; }
+    case 'semana': {
+      const dow = (base.getDay() + 6) % 7; // 0 = lunes
+      const lunes = addDays(hoy, -dow);
+      return { desde: lunes, hasta: addDays(lunes, 6) };
+    }
+    case 'semana_pasada': {
+      const dow = (base.getDay() + 6) % 7;
+      const lunes = addDays(hoy, -dow - 7);
+      return { desde: lunes, hasta: addDays(lunes, 6) };
+    }
+    case 'mes': return { desde: `${y}-${m}-01`, hasta: `${y}-${m}-${String(daysInMonth(base)).padStart(2, '0')}` };
+    case 'mes_pasado': {
+      const d = new Date(y, base.getMonth() - 1, 1);
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      return { desde: `${d.getFullYear()}-${mm}-01`, hasta: `${d.getFullYear()}-${mm}-${String(daysInMonth(d)).padStart(2, '0')}` };
+    }
+    case 'anio': return { desde: `${y}-01-01`, hasta: `${y}-12-31` };
+    case 'todo': return { desde: '', hasta: '' };
+    default: return { desde: hoy, hasta: hoy };
+  }
+};
+
+const PRESETS_FECHA = [
+  { id: 'hoy', label: 'Hoy' },
+  { id: 'ayer', label: 'Ayer' },
+  { id: 'semana', label: 'Esta semana' },
+  { id: 'semana_pasada', label: 'Semana pasada' },
+  { id: 'mes', label: 'Este mes' },
+  { id: 'mes_pasado', label: 'Mes pasado' },
+  { id: 'anio', label: 'Este año' },
+  { id: 'todo', label: 'Todo' },
+  { id: 'custom', label: 'Personalizado' },
+];
+
+// Hook que mantiene el estado de un rango de fechas (preset + desde/hasta).
+function useRangoFechas(presetInicial = 'mes') {
+  const [preset, setPreset] = useState(presetInicial);
+  const [custom, setCustom] = useState(() => rangoPreset('mes'));
+  const rango = preset === 'custom' ? custom : rangoPreset(preset);
+  const label = (() => {
+    if (preset === 'todo') return 'Todo el historial';
+    if (preset === 'custom') return `${custom.desde || '…'} → ${custom.hasta || '…'}`;
+    const p = PRESETS_FECHA.find((x) => x.id === preset);
+    return rango.desde === rango.hasta ? `${p.label} · ${diaSemanaLabel(rango.desde)}` : `${p.label} · ${rango.desde} → ${rango.hasta}`;
+  })();
+  return { preset, setPreset, custom, setCustom, desde: rango.desde, hasta: rango.hasta, label };
+}
 
 /* ------------------------------------------------------------
    2. DATOS MOCK INICIALES (editables desde la UI)
@@ -110,10 +178,26 @@ const MOCK_CONFIG = {
   costosFijos: 3216000,
   cajaInicial: 300000,
   costoInsumoBase: 8000, // ej: costo por coco en Abasto
+  // Comisión (%) que cobra cada medio de pago. Se registra como egreso
+  // "Comisión Medio de Pago" al confirmar la venta, así el flujo de caja
+  // refleja lo que realmente entra. Editable desde Ajustes.
+  comisiones: { Efectivo: 0, Transferencia: 0, POS: 4, 'QR / Billetera': 1.5, Crédito: 0 },
 };
 
+// Métodos de pago del POS. "POS" = tarjeta débito/crédito por posnet;
+// "QR / Billetera" = Tigo Money, Personal Pay, Zimple, QR bancario.
+const METODOS_PAGO = ['Efectivo', 'Transferencia', 'POS', 'QR / Billetera', 'Crédito'];
+const METODO_TONE = { Efectivo: 'emerald', Transferencia: 'slate', POS: 'amber', 'QR / Billetera': 'amber', Crédito: 'rose' };
+
 const CATEGORIAS_INGRESO = ['Venta', 'Cobro CxC', 'Otro Ingreso'];
-const CATEGORIAS_EGRESO = ['Compra Mercadería', 'Sueldos', 'Flete', 'Servicios', 'Pago CxP', 'Otro Egreso'];
+const CATEGORIAS_EGRESO = [
+  'Compra Mercadería', 'Sueldos', 'Alquiler', 'Servicios', 'Flete', 'Marketing',
+  'Comisión Medio de Pago', 'Impuestos', 'Mantenimiento', 'Pago CxP', 'Otro Egreso',
+];
+
+// Empleados (módulo Sueldos). Los pagos siguen viviendo en "pagosPersonal".
+const MOCK_EMPLEADOS = [];
+const FRECUENCIAS_SUELDO = ['Semanal', 'Quincenal', 'Mensual'];
 const CANALES = ['B2C', 'B2B', 'Evento'];
 const CANALES_PRODUCTO = ['B2C', 'B2B', 'Evento', 'Todos'];
 const CANAL_TONE = { B2C: 'emerald', B2B: 'slate', Evento: 'amber' };
@@ -174,10 +258,19 @@ function DataProvider({ children }) {
   const [movimientos, setMovimientos, l5] = useSyncedState('movimientos', MOCK_MOVIMIENTOS);
   const [cuentasCobrar, setCuentasCobrar, l6] = useSyncedState('cuentasCobrar', MOCK_CUENTAS_COBRAR);
   const [cuentasPagar, setCuentasPagar, l7] = useSyncedState('cuentasPagar', MOCK_CUENTAS_PAGAR);
-  const [config, setConfig, l8] = useSyncedState('config', MOCK_CONFIG);
+  const [configRaw, setConfig, l8] = useSyncedState('config', MOCK_CONFIG);
   const [pagosPersonal, setPagosPersonal, l9] = useSyncedState('pagosPersonal', []);
+  const [empleados, setEmpleados, l10] = useSyncedState('empleados', MOCK_EMPLEADOS);
 
-  const listo = l1 && l2 && l3 && l4 && l5 && l6 && l7 && l8 && l9;
+  // Config con valores por defecto para claves nuevas (ej. comisiones), así el
+  // documento ya guardado en Firestore sigue funcionando sin migración.
+  const config = useMemo(
+    () => ({ ...MOCK_CONFIG, ...configRaw, comisiones: { ...MOCK_CONFIG.comisiones, ...(configRaw?.comisiones || {}) } }),
+    [configRaw]
+  );
+  const comisionDe = (metodo) => Number(config.comisiones?.[metodo] || 0);
+
+  const listo = l1 && l2 && l3 && l4 && l5 && l6 && l7 && l8 && l9 && l10;
 
   const nombreContacto = (id) => contactos.find((c) => c.id === id)?.nombre || 'Consumidor final';
 
@@ -315,11 +408,24 @@ function DataProvider({ children }) {
         });
       } else {
         nuevosMov.push({
-          id: movId++, venta_id: id, fecha: fechaVenta, tipo: 'Ingreso', categoria: 'Venta',
+          id: movId++, venta_id: id, fecha: fechaVenta, tipo: 'Ingreso', categoria: 'Venta', metodo_pago: metodoPago, canal,
           monto: l.total, descripcion: `Venta ${canal} - ${l.nombreProd} x${l.cantidad} (${metodoPago})`,
         });
       }
     });
+
+    // Comisión del medio de pago (POS, QR): un egreso vinculado a la venta,
+    // para que el neto de caja sea lo que realmente entra.
+    const pctComision = metodoPago === 'Crédito' ? 0 : comisionDe(metodoPago);
+    if (pctComision > 0 && totalVenta > 0) {
+      const comision = Math.round((totalVenta * pctComision) / 100);
+      if (comision > 0) {
+        nuevosMov.push({
+          id: movId++, venta_id: nuevasVentas[0]?.id, comision_venta: true, fecha: fechaVenta, tipo: 'Egreso', categoria: 'Comisión Medio de Pago',
+          metodo_pago: metodoPago, monto: comision, descripcion: `Comisión ${pctComision}% ${metodoPago} sobre ${formatGs(totalVenta)}`,
+        });
+      }
+    }
 
     setVentas((prev) => [...prev, ...nuevasVentas]);
     if (nuevasCxc.length) setCuentasCobrar((prev) => [...prev, ...nuevasCxc]);
@@ -408,13 +514,13 @@ function DataProvider({ children }) {
 
   // Pagos de personal: cada pago genera un egreso de caja (categoría Sueldos)
   // vinculado por pago_personal_id, así se cruza con Caja, Dashboard y Reportes.
-  const registrarPagoPersonal = ({ fecha, empleado, concepto, monto, nota }) => {
+  const registrarPagoPersonal = ({ fecha, empleado, concepto, monto, nota, empleadoId = null, metodoPago = 'Efectivo', periodo = '' }) => {
     const id = nextId(pagosPersonal);
     const movId = nextId(movimientos);
-    setPagosPersonal((prev) => [...prev, { id, fecha, empleado, concepto, monto, nota: nota || '' }]);
+    setPagosPersonal((prev) => [...prev, { id, fecha, empleado, concepto, monto, nota: nota || '', empleado_id: empleadoId, metodo_pago: metodoPago, periodo }]);
     setMovimientos((prev) => [
       ...prev,
-      { id: movId, pago_personal_id: id, fecha, tipo: 'Egreso', categoria: 'Sueldos', monto, descripcion: `${concepto} - ${empleado}` },
+      { id: movId, pago_personal_id: id, fecha, tipo: 'Egreso', categoria: 'Sueldos', monto, metodo_pago: metodoPago, descripcion: `${concepto} - ${empleado}${periodo ? ` · ${periodo}` : ''}` },
     ]);
   };
   const updatePagoPersonal = (id, patch) => {
@@ -425,7 +531,7 @@ function DataProvider({ children }) {
     setMovimientos((prev) =>
       prev.map((m) =>
         m.pago_personal_id === id
-          ? { ...m, fecha: merged.fecha, monto: merged.monto, descripcion: `${merged.concepto} - ${merged.empleado}` }
+          ? { ...m, fecha: merged.fecha, monto: merged.monto, metodo_pago: merged.metodo_pago || m.metodo_pago, descripcion: `${merged.concepto} - ${merged.empleado}${merged.periodo ? ` · ${merged.periodo}` : ''}` }
           : m
       )
     );
@@ -437,6 +543,11 @@ function DataProvider({ children }) {
 
   const updateConfig = (patch) => setConfig((prev) => ({ ...prev, ...patch }));
 
+  // ---- Empleados (módulo Sueldos) ----
+  const addEmpleado = (e) => setEmpleados((prev) => [...prev, { ...e, id: nextId(prev), activo: true }]);
+  const updateEmpleado = (id, patch) => setEmpleados((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+  const deleteEmpleado = (id) => setEmpleados((prev) => prev.filter((e) => e.id !== id));
+
   const importState = (data) => {
     if (data.productos) setProductos(data.productos);
     if (data.contactos) setContactos(data.contactos);
@@ -447,11 +558,13 @@ function DataProvider({ children }) {
     if (data.cuentasPagar) setCuentasPagar(data.cuentasPagar);
     if (data.config) setConfig(data.config);
     if (data.pagosPersonal) setPagosPersonal(data.pagosPersonal);
+    if (data.empleados) setEmpleados(data.empleados);
   };
 
   const value = {
-    productos, contactos, ventas, compras, movimientos, cuentasCobrar, cuentasPagar, config, pagosPersonal,
+    productos, contactos, ventas, compras, movimientos, cuentasCobrar, cuentasPagar, config, pagosPersonal, empleados,
     registrarPagoPersonal, updatePagoPersonal, deletePagoPersonal,
+    addEmpleado, updateEmpleado, deleteEmpleado, comisionDe,
     nombreContacto, updateProducto, addProducto, deleteProducto, registrarVentaCarrito, updateVenta, deleteVenta,
     addMovimiento, updateMovimiento, deleteMovimiento,
     addContacto, updateContacto, deleteContacto, registrarCompra, updateCompra, deleteCompra,
@@ -546,6 +659,35 @@ function Modal({ open, onClose, title, children, width = 'max-w-lg' }) {
   );
 }
 
+// Selector de rango de fechas reutilizable: presets (Hoy, Ayer, Esta semana, Este
+// mes, Este año, Todo) + rango personalizado desde/hasta. Se usa con useRangoFechas.
+function SelectorFechas({ rango, compacto = false }) {
+  const { preset, setPreset, custom, setCustom, label } = rango;
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-1.5">
+        {PRESETS_FECHA.map((p) => (
+          <button key={p.id} onClick={() => setPreset(p.id)}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+              preset === p.id ? 'bg-emerald-700 text-white border-emerald-700' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+            }`}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+      {preset === 'custom' && (
+        <div className="flex flex-wrap items-center gap-2">
+          <input type="date" className={`${inputCls} w-auto`} value={custom.desde} onChange={(e) => setCustom({ ...custom, desde: e.target.value })} />
+          <span className="text-xs text-slate-400">hasta</span>
+          <input type="date" className={`${inputCls} w-auto`} value={custom.hasta} onChange={(e) => setCustom({ ...custom, hasta: e.target.value })} />
+        </div>
+      )}
+      {!compacto && (
+        <p className="text-xs text-slate-500 flex items-center gap-1.5"><CalendarRange size={13} className="text-slate-400" /> {label}</p>
+      )}
+    </div>
+  );
+}
 function ChartTooltip({ active, payload, label }) {
   if (!active || !payload || !payload.length) return null;
   return (
@@ -573,6 +715,8 @@ const NAV_ITEMS = [
   { id: 'productos', label: 'Catálogo y Costeo', icon: Package },
   { id: 'compras', label: 'Compras y Proveedores', icon: Truck },
   { id: 'caja', label: 'Caja y Cuentas', icon: Wallet },
+  { id: 'flujo', label: 'Flujo de Caja', icon: CalendarRange },
+  { id: 'sueldos', label: 'Sueldos', icon: Users },
   { id: 'reportes', label: 'Reportes', icon: BarChart3 },
   { id: 'ajustes', label: 'Ajustes', icon: Settings },
 ];
@@ -638,6 +782,27 @@ function Dashboard() {
   }));
   const maxCanal = Math.max(1, ...ventasPorCanal.map((c) => c.total));
 
+  // Pulso rápido: hoy, ayer y esta semana (ventas e ingresos reales de caja).
+  const pulso = useMemo(() => {
+    const calc = (preset) => {
+      const { desde, hasta } = rangoPreset(preset, now);
+      const vs = ventas.filter((v) => enRango(v.fecha, desde, hasta));
+      const ms = movimientos.filter((m) => enRango(m.fecha, desde, hasta));
+      return {
+        vendido: vs.reduce((s, v) => s + v.total, 0),
+        ingresos: ms.filter((m) => m.tipo === 'Ingreso').reduce((s, m) => s + m.monto, 0),
+        egresos: ms.filter((m) => m.tipo === 'Egreso').reduce((s, m) => s + m.monto, 0),
+      };
+    };
+    return [
+      { label: 'Hoy', ...calc('hoy') },
+      { label: 'Ayer', ...calc('ayer') },
+      { label: 'Esta semana', ...calc('semana') },
+      { label: 'Semana pasada', ...calc('semana_pasada') },
+    ];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ventas, movimientos]);
+
   const kpis = [
     { label: 'Ventas del Mes', value: formatGs(totalVentasMes), icon: TrendingUp },
     { label: 'Compras del Mes', value: formatGs(totalComprasMes), icon: Truck },
@@ -668,6 +833,26 @@ function Dashboard() {
           );
         })}
       </div>
+
+      {/* Pulso diario / semanal */}
+      <Card className="p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-slate-700">Pulso de ventas</h3>
+          <span className="text-xs text-slate-400">Detalle por día en "Flujo de Caja"</span>
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          {pulso.map((p) => (
+            <div key={p.label} className="bg-slate-50 rounded-lg p-3">
+              <div className="text-xs text-slate-500 mb-1">{p.label}</div>
+              <div className="font-bold text-slate-800 tabular-nums">{formatGs(p.vendido)}</div>
+              <div className="text-xs mt-1 flex justify-between">
+                <span className="text-emerald-700 tabular-nums">+{formatGsCompact(p.ingresos)}</span>
+                <span className="text-rose-600 tabular-nums">-{formatGsCompact(p.egresos)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Card>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Termómetro Punto de Equilibrio */}
@@ -980,7 +1165,7 @@ function ProductosPage() {
    8. PUNTO DE VENTA (POS)
    ------------------------------------------------------------ */
 function POSPage() {
-  const { productos, contactos, registrarVentaCarrito } = useData();
+  const { productos, contactos, registrarVentaCarrito, comisionDe } = useData();
   const [canal, setCanal] = useState('B2C');
   const [cart, setCart] = useState([]); // { producto_id, cantidad }
   const [metodoPago, setMetodoPago] = useState('Efectivo');
@@ -1026,6 +1211,8 @@ function POSPage() {
   const totalCarrito = items.reduce((s, i) => s + i.subtotal, 0);
   const costoCarrito = items.reduce((s, i) => s + i.costo, 0);
   const margenCarrito = totalCarrito - costoCarrito;
+  const pctComision = comisionDe(metodoPago);
+  const comisionCarrito = metodoPago === 'Crédito' ? 0 : Math.round((totalCarrito * pctComision) / 100);
 
   const confirmarVenta = () => {
     if (items.length === 0) return;
@@ -1116,6 +1303,12 @@ function POSPage() {
               <div className="space-y-1 text-sm mb-4 border-t border-slate-200 pt-3">
                 <div className="flex justify-between"><span className="text-slate-500">Total</span><span className="font-bold tabular-nums">{formatGs(totalCarrito)}</span></div>
                 <div className="flex justify-between text-xs text-slate-400"><span>Margen estimado</span><span className="tabular-nums">{formatGs(margenCarrito)}</span></div>
+                {comisionCarrito > 0 && (
+                  <>
+                    <div className="flex justify-between text-xs text-amber-600"><span>Comisión {metodoPago} ({pctComision}%)</span><span className="tabular-nums">-{formatGs(comisionCarrito)}</span></div>
+                    <div className="flex justify-between text-xs text-slate-600 font-medium"><span>Neto a caja</span><span className="tabular-nums">{formatGs(totalCarrito - comisionCarrito)}</span></div>
+                  </>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3 mb-3">
@@ -1124,7 +1317,7 @@ function POSPage() {
                 </Field>
                 <Field label="Forma de cobro">
                   <select className={inputCls} value={metodoPago} onChange={(e) => setMetodoPago(e.target.value)}>
-                    <option>Efectivo</option><option>Transferencia</option><option>Crédito</option>
+                    {METODOS_PAGO.map((m) => <option key={m} value={m}>{m}</option>)}
                   </select>
                 </Field>
               </div>
@@ -1564,14 +1757,14 @@ function ComprasPage() {
    ------------------------------------------------------------ */
 function NuevoMovimientoModal({ open, onClose }) {
   const { addMovimiento } = useData();
-  const [form, setForm] = useState({ tipo: 'Egreso', categoria: 'Compra Mercadería', monto: '', fecha: todayISO(), descripcion: '' });
+  const [form, setForm] = useState({ tipo: 'Egreso', categoria: 'Compra Mercadería', monto: '', fecha: todayISO(), descripcion: '', metodo_pago: 'Efectivo' });
 
   const categorias = form.tipo === 'Ingreso' ? CATEGORIAS_INGRESO : CATEGORIAS_EGRESO;
 
   const guardar = () => {
     if (!form.monto) return;
     addMovimiento({ ...form, monto: Number(form.monto) });
-    setForm({ tipo: 'Egreso', categoria: 'Compra Mercadería', monto: '', fecha: todayISO(), descripcion: '' });
+    setForm({ tipo: 'Egreso', categoria: 'Compra Mercadería', monto: '', fecha: todayISO(), descripcion: '', metodo_pago: 'Efectivo' });
     onClose();
   };
 
@@ -1600,6 +1793,11 @@ function NuevoMovimientoModal({ open, onClose }) {
         <Field label="Descripción">
           <input className={inputCls} value={form.descripcion} onChange={(e) => setForm({ ...form, descripcion: e.target.value })} />
         </Field>
+        <Field label="Medio de pago">
+          <select className={inputCls} value={form.metodo_pago} onChange={(e) => setForm({ ...form, metodo_pago: e.target.value })}>
+            {METODOS_PAGO.filter((m) => m !== 'Crédito').map((m) => <option key={m}>{m}</option>)}
+          </select>
+        </Field>
         <Button className="w-full mt-2" onClick={guardar}>Guardar movimiento</Button>
       </div>
     </Modal>
@@ -1617,10 +1815,15 @@ function MovimientosTab() {
 
   const mesActual = monthKey(new Date());
   const [mesFiltro, setMesFiltro] = useState(mesesDisponibles.includes(mesActual) ? mesActual : 'Todos');
+  // Filtro por rango de fechas (día / semana / año / personalizado), además del mes.
+  const rango = useRangoFechas('todo');
+  const [tipoFiltro, setTipoFiltro] = useState('Todos');
 
   const filtrados = movimientos
     .filter((m) => mesFiltro === 'Todos' || m.fecha.slice(0, 7) === mesFiltro)
-    .sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+    .filter((m) => enRango(m.fecha, rango.desde, rango.hasta))
+    .filter((m) => tipoFiltro === 'Todos' || m.tipo === tipoFiltro)
+    .sort((a, b) => (a.fecha < b.fecha ? 1 : a.fecha > b.fecha ? -1 : b.id - a.id));
 
   const ingresos = filtrados.filter((m) => m.tipo === 'Ingreso').reduce((s, m) => s + m.monto, 0);
   const egresos = filtrados.filter((m) => m.tipo === 'Egreso').reduce((s, m) => s + m.monto, 0);
@@ -1643,8 +1846,19 @@ function MovimientosTab() {
         </div>
         <Button onClick={() => setOpen(true)}><Plus size={16} /> Nuevo movimiento</Button>
       </div>
+      <Card className="p-4 space-y-3">
+        <SelectorFechas rango={rango} />
+        <div className="flex gap-1.5">
+          {['Todos', 'Ingreso', 'Egreso'].map((t) => (
+            <button key={t} onClick={() => setTipoFiltro(t)}
+              className={`px-2.5 py-1 rounded-md text-xs font-medium border ${tipoFiltro === t ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-600 border-slate-300'}`}>
+              {t === 'Todos' ? 'Ingresos y egresos' : `Solo ${t.toLowerCase()}s`}
+            </button>
+          ))}
+        </div>
+      </Card>
       <p className="text-xs text-slate-400">
-        Los movimientos marcados "Vinculado" los generó una venta o compra — se editan desde ahí, para no desordenar la contabilidad.
+        Los movimientos marcados "Vinculado" los generó una venta, compra o pago de personal — se editan desde ahí, para no desordenar la contabilidad. Si elegís un rango de fechas, se combina con el mes seleccionado (dejá "Todos los meses" para usar solo el rango).
       </p>
       <Card className="overflow-hidden">
         <table className="w-full text-sm">
@@ -1660,7 +1874,7 @@ function MovimientosTab() {
           </thead>
           <tbody>
             {filtrados.map((m) => {
-              const vinculado = Boolean(m.venta_id || m.compra_id || m.pago_personal_id);
+              const vinculado = Boolean(m.venta_id || m.compra_id || m.pago_personal_id || m.comision_venta);
               return (
                 <tr key={m.id} className="border-t border-slate-100">
                   <td className="px-4 py-2.5">
@@ -2067,7 +2281,7 @@ function CajaPage() {
    10. REPORTES (ventas y gastos por mes / año / acumulados)
    ------------------------------------------------------------ */
 function ReportesPage() {
-  const { ventas, movimientos, compras, productos, contactos, nombreContacto, pagosPersonal } = useData();
+  const { ventas, movimientos, compras, productos, contactos, nombreContacto, pagosPersonal, empleados, config } = useData();
   const [vista, setVista] = useState('mensual'); // 'mensual' | 'anual'
   const [anioFiltro, setAnioFiltro] = useState('Todos');
 
@@ -2099,14 +2313,28 @@ function ReportesPage() {
     }));
 
     const hojaMovimientos = [...movimientos].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)).map((m) => ({
-      Fecha: m.fecha, Tipo: m.tipo, Categoría: m.categoria, Descripción: m.descripcion || '', Monto: m.monto,
+      Fecha: m.fecha, Tipo: m.tipo, Categoría: m.categoria, Descripción: m.descripcion || '', 'Medio de Pago': m.metodo_pago || '', Monto: m.monto,
     }));
+
+    // Flujo de caja día por día (todo el historial), con saldo acumulado.
+    const diasMap = {};
+    ventas.forEach((v) => { diasMap[v.fecha] = diasMap[v.fecha] || { vendido: 0, ingresos: 0, egresos: 0 }; diasMap[v.fecha].vendido += v.total; });
+    movimientos.forEach((m) => { diasMap[m.fecha] = diasMap[m.fecha] || { vendido: 0, ingresos: 0, egresos: 0 }; diasMap[m.fecha][m.tipo === 'Ingreso' ? 'ingresos' : 'egresos'] += m.monto; });
+    let saldoAcum = config.cajaInicial || 0;
+    const hojaFlujo = Object.keys(diasMap).sort().map((f) => {
+      const d = diasMap[f];
+      saldoAcum += d.ingresos - d.egresos;
+      return { Fecha: f, Día: DIAS_SEMANA[new Date(`${f}T00:00:00`).getDay()], Vendido: d.vendido, 'Ingresos Caja': d.ingresos, Egresos: d.egresos, 'Neto del Día': d.ingresos - d.egresos, 'Saldo Acumulado': saldoAcum };
+    });
 
     const hojaStock = resumenStock(productos, compras, ventas).map((f) => ({
       Producto: f.nombre, Categoría: f.categoria, 'Stock Actual': f.stock, Comprado: f.comprado, Vendido: f.vendido,
     }));
     const hojaPersonal = [...pagosPersonal].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)).map((p) => ({
-      Fecha: p.fecha, Empleado: p.empleado, Concepto: p.concepto, Monto: p.monto, Nota: p.nota || '',
+      Fecha: p.fecha, Empleado: p.empleado, Concepto: p.concepto, Período: p.periodo || '', 'Medio de Pago': p.metodo_pago || '', Monto: p.monto, Nota: p.nota || '',
+    }));
+    const hojaEmpleados = empleados.map((e) => ({
+      Nombre: e.nombre, Cargo: e.cargo || '', 'Sueldo Base': e.sueldo_base, Frecuencia: e.frecuencia, Activo: e.activo === false ? 'No' : 'Sí',
     }));
 
     const wb = XLSX.utils.book_new();
@@ -2117,6 +2345,8 @@ function ReportesPage() {
 
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaStock), 'Stock');
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaPersonal), 'Pago de Personal');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaEmpleados), 'Empleados');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(hojaFlujo), 'Flujo Diario');
 
     XLSX.writeFile(wb, `CoCool_Reporte_${todayISO()}.xlsx`);
   };
@@ -2400,17 +2630,553 @@ function ReportesPage() {
 }
 
 /* ------------------------------------------------------------
+   10a. FLUJO DE CAJA (por día / semana / mes / año / rango libre)
+   ------------------------------------------------------------ */
+function FlujoCajaPage() {
+  const { ventas, movimientos, config } = useData();
+  const rango = useRangoFechas('semana');
+  const { desde, hasta } = rango;
+
+  // Ventas (devengadas, incluye crédito) y movimientos de caja del período.
+  const ventasPeriodo = useMemo(() => ventas.filter((v) => enRango(v.fecha, desde, hasta)), [ventas, desde, hasta]);
+  const movsPeriodo = useMemo(() => movimientos.filter((m) => enRango(m.fecha, desde, hasta)), [movimientos, desde, hasta]);
+
+  const ingresos = movsPeriodo.filter((m) => m.tipo === 'Ingreso').reduce((s, m) => s + m.monto, 0);
+  const egresos = movsPeriodo.filter((m) => m.tipo === 'Egreso').reduce((s, m) => s + m.monto, 0);
+  const totalVendido = ventasPeriodo.reduce((s, v) => s + v.total, 0);
+  const margenPeriodo = ventasPeriodo.reduce((s, v) => s + v.margen, 0);
+  const ventasCredito = ventasPeriodo.filter((v) => v.metodo_pago === 'Crédito').reduce((s, v) => s + v.total, 0);
+
+  // Saldo de caja acumulado hasta el final del período (caja inicial + todo lo anterior).
+  const saldoAlCierre = useMemo(() => {
+    const hastaFecha = hasta || '9999-12-31';
+    return movimientos.filter((m) => m.fecha <= hastaFecha).reduce((s, m) => s + (m.tipo === 'Ingreso' ? m.monto : -m.monto), config.cajaInicial);
+  }, [movimientos, hasta, config.cajaInicial]);
+  const saldoAlInicio = useMemo(() => {
+    if (!desde) return config.cajaInicial;
+    return movimientos.filter((m) => m.fecha < desde).reduce((s, m) => s + (m.tipo === 'Ingreso' ? m.monto : -m.monto), config.cajaInicial);
+  }, [movimientos, desde, config.cajaInicial]);
+
+  // Serie diaria: un punto por cada día con actividad (ventas o movimientos).
+  const porDia = useMemo(() => {
+    const map = {};
+    const ensure = (f) => {
+      if (!map[f]) map[f] = { fecha: f, vendido: 0, ingresos: 0, egresos: 0, transacciones: 0 };
+      return map[f];
+    };
+    ventasPeriodo.forEach((v) => { const r = ensure(v.fecha); r.vendido += v.total; r.transacciones += 1; });
+    movsPeriodo.forEach((m) => { const r = ensure(m.fecha); if (m.tipo === 'Ingreso') r.ingresos += m.monto; else r.egresos += m.monto; });
+    let acc = saldoAlInicio;
+    return Object.values(map)
+      .sort((a, b) => (a.fecha < b.fecha ? -1 : 1))
+      .map((r) => {
+        acc += r.ingresos - r.egresos;
+        return { ...r, neto: r.ingresos - r.egresos, saldo: acc, label: diaSemanaLabel(r.fecha) };
+      });
+  }, [ventasPeriodo, movsPeriodo, saldoAlInicio]);
+
+  // Si el rango es largo (más de ~45 días) el gráfico se agrupa por mes para que se lea.
+  const agruparPorMes = porDia.length > 45;
+  const serieGrafico = useMemo(() => {
+    if (!agruparPorMes) return porDia;
+    const map = {};
+    porDia.forEach((r) => {
+      const mk = r.fecha.slice(0, 7);
+      if (!map[mk]) map[mk] = { fecha: mk, label: mesLabelCorto(mk), vendido: 0, ingresos: 0, egresos: 0, neto: 0, saldo: 0 };
+      map[mk].vendido += r.vendido; map[mk].ingresos += r.ingresos; map[mk].egresos += r.egresos; map[mk].neto += r.neto; map[mk].saldo = r.saldo;
+    });
+    return Object.values(map);
+  }, [porDia, agruparPorMes]);
+
+  // Desglose de ingresos por medio de pago (sobre ventas, que siempre tienen metodo_pago).
+  const porMetodo = useMemo(() => {
+    const map = {};
+    ventasPeriodo.forEach((v) => { map[v.metodo_pago] = (map[v.metodo_pago] || 0) + v.total; });
+    return Object.entries(map).map(([metodo, total]) => ({ metodo, total })).sort((a, b) => b.total - a.total);
+  }, [ventasPeriodo]);
+  const maxMetodo = Math.max(1, ...porMetodo.map((m) => m.total));
+
+  // Desglose de egresos por categoría.
+  const porCategoria = useMemo(() => {
+    const map = {};
+    movsPeriodo.filter((m) => m.tipo === 'Egreso').forEach((m) => { map[m.categoria] = (map[m.categoria] || 0) + m.monto; });
+    return Object.entries(map).map(([categoria, total]) => ({ categoria, total })).sort((a, b) => b.total - a.total);
+  }, [movsPeriodo]);
+  const maxCategoria = Math.max(1, ...porCategoria.map((c) => c.total));
+
+  // Ventas por día de la semana (promedio por día con actividad) — para ver qué días son fuertes.
+  const porDiaSemana = useMemo(() => {
+    const acc = DIAS_SEMANA.map((d) => ({ dia: d, total: 0, dias: 0 }));
+    porDia.forEach((r) => {
+      const idx = new Date(`${r.fecha}T00:00:00`).getDay();
+      acc[idx].total += r.vendido;
+      if (r.vendido > 0) acc[idx].dias += 1;
+    });
+    // Reordenar para que arranque el lunes
+    return [...acc.slice(1), acc[0]].map((d) => ({ ...d, promedio: d.dias ? d.total / d.dias : 0 }));
+  }, [porDia]);
+
+  const kpis = [
+    { label: 'Vendido', value: formatGs(totalVendido), sub: `${ventasPeriodo.length} línea(s) de venta`, tone: 'text-slate-800', icon: TrendingUp },
+    { label: 'Ingresos de caja', value: formatGs(ingresos), sub: ventasCredito ? `+ ${formatGs(ventasCredito)} a crédito (pendiente)` : 'Cobrado efectivamente', tone: 'text-emerald-700', icon: ArrowDownRight },
+    { label: 'Egresos', value: formatGs(egresos), sub: `${movsPeriodo.filter((m) => m.tipo === 'Egreso').length} gasto(s)`, tone: 'text-rose-600', icon: ArrowUpRight },
+    { label: 'Flujo neto', value: formatGs(ingresos - egresos), sub: 'Ingresos − egresos del período', tone: ingresos - egresos >= 0 ? 'text-emerald-700' : 'text-rose-600', icon: Banknote },
+    { label: 'Saldo de caja al cierre', value: formatGs(saldoAlCierre), sub: `Al inicio: ${formatGs(saldoAlInicio)}`, tone: saldoAlCierre >= 0 ? 'text-slate-800' : 'text-rose-600', icon: Wallet },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-xl font-semibold text-slate-800">Flujo de Caja</h2>
+        <p className="text-sm text-slate-500">Cuánto vendiste, cuánto entró y cuánto salió — por día, semana, mes, año o el rango que elijas.</p>
+      </div>
+
+      <Card className="p-4">
+        <SelectorFechas rango={rango} />
+      </Card>
+
+      {/* KPIs */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+        {kpis.map((k) => {
+          const Icon = k.icon;
+          return (
+            <Card key={k.label} className="p-4">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-medium text-slate-500">{k.label}</span>
+                <Icon size={16} className="text-slate-400" />
+              </div>
+              <div className={`text-lg font-bold tabular-nums ${k.tone}`}>{k.value}</div>
+              <div className="text-xs text-slate-400 mt-0.5">{k.sub}</div>
+            </Card>
+          );
+        })}
+      </div>
+
+      {/* Gráfico diario */}
+      <Card className="p-5">
+        <h3 className="text-sm font-semibold text-slate-700 mb-1">Ingresos vs. Egresos {agruparPorMes ? 'por mes' : 'por día'}</h3>
+        <p className="text-xs text-slate-500 mb-4">Margen bruto del período: <b className="text-slate-700">{formatGs(margenPeriodo)}</b>{totalVendido ? ` (${((margenPeriodo / totalVendido) * 100).toFixed(1)}%)` : ''}</p>
+        {serieGrafico.length === 0 ? (
+          <p className="text-sm text-slate-400 text-center py-10">No hay movimientos en el período seleccionado.</p>
+        ) : (
+          <div style={{ width: '100%', height: 280 }}>
+            <ResponsiveContainer>
+              <ComposedChart data={serieGrafico} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#64748b' }} axisLine={{ stroke: '#e2e8f0' }} tickLine={false} />
+                <YAxis tickFormatter={formatGsCompact} tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={50} />
+                <Tooltip content={<ChartTooltip />} cursor={{ fill: '#f1f5f9' }} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="ingresos" name="Ingresos" fill="#047857" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="egresos" name="Egresos" fill="#e11d48" radius={[4, 4, 0, 0]} />
+                <Line type="monotone" dataKey="saldo" name="Saldo de caja" stroke="#0f172a" strokeWidth={2} dot={false} strokeDasharray="4 3" />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </Card>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* Por medio de pago */}
+        <Card className="p-5">
+          <h3 className="text-sm font-semibold text-slate-700 mb-4">Ventas por medio de pago</h3>
+          {porMetodo.length === 0 ? <p className="text-sm text-slate-400">Sin ventas en el período.</p> : (
+            <div className="space-y-3">
+              {porMetodo.map((m) => (
+                <div key={m.metodo}>
+                  <div className="flex justify-between text-xs mb-1">
+                    <span className="font-medium text-slate-600">{m.metodo}</span>
+                    <span className="tabular-nums text-slate-500">{formatGs(m.total)} · {((m.total / Math.max(1, totalVendido)) * 100).toFixed(0)}%</span>
+                  </div>
+                  <ProgressBar pct={(m.total / maxMetodo) * 100} tone={METODO_TONE[m.metodo] || 'slate'} height="h-2.5" />
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        {/* Por categoría de gasto */}
+        <Card className="p-5">
+          <h3 className="text-sm font-semibold text-slate-700 mb-4">¿A dónde se fue la plata?</h3>
+          {porCategoria.length === 0 ? <p className="text-sm text-slate-400">Sin egresos en el período.</p> : (
+            <div className="space-y-3">
+              {porCategoria.map((c) => (
+                <div key={c.categoria}>
+                  <div className="flex justify-between text-xs mb-1">
+                    <span className="font-medium text-slate-600">{c.categoria}</span>
+                    <span className="tabular-nums text-slate-500">{formatGs(c.total)} · {((c.total / Math.max(1, egresos)) * 100).toFixed(0)}%</span>
+                  </div>
+                  <ProgressBar pct={(c.total / maxCategoria) * 100} tone="rose" height="h-2.5" />
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        {/* Por día de la semana */}
+        <Card className="p-5">
+          <h3 className="text-sm font-semibold text-slate-700 mb-1">Ventas por día de la semana</h3>
+          <p className="text-xs text-slate-400 mb-4">Promedio por día con ventas, en el período.</p>
+          {totalVendido === 0 ? <p className="text-sm text-slate-400">Sin ventas en el período.</p> : (
+            <div className="space-y-2">
+              {porDiaSemana.map((d) => {
+                const maxProm = Math.max(1, ...porDiaSemana.map((x) => x.promedio));
+                return (
+                  <div key={d.dia} className="flex items-center gap-2 text-xs">
+                    <span className="w-8 font-medium text-slate-600">{d.dia}</span>
+                    <div className="flex-1"><ProgressBar pct={(d.promedio / maxProm) * 100} tone="emerald" height="h-2.5" /></div>
+                    <span className="w-20 text-right tabular-nums text-slate-500">{formatGsCompact(d.promedio)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* Tabla por día */}
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
+            <tr>
+              <th className="text-left px-4 py-2.5">Día</th>
+              <th className="text-right px-4 py-2.5">Vendido</th>
+              <th className="text-right px-4 py-2.5">Ingresos caja</th>
+              <th className="text-right px-4 py-2.5">Egresos</th>
+              <th className="text-right px-4 py-2.5">Neto del día</th>
+              <th className="text-right px-4 py-2.5">Saldo acumulado</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...porDia].reverse().map((r) => (
+              <tr key={r.fecha} className="border-t border-slate-100">
+                <td className="px-4 py-2.5 font-medium text-slate-700">{r.label} <span className="text-xs text-slate-400 font-normal">{r.fecha}</span></td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-slate-700">{formatGs(r.vendido)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-emerald-700 font-medium">{formatGs(r.ingresos)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-rose-600 font-medium">{formatGs(r.egresos)}</td>
+                <td className={`px-4 py-2.5 text-right tabular-nums font-semibold ${r.neto >= 0 ? 'text-slate-800' : 'text-rose-600'}`}>{formatGs(r.neto)}</td>
+                <td className={`px-4 py-2.5 text-right tabular-nums ${r.saldo >= 0 ? 'text-slate-500' : 'text-rose-600'}`}>{formatGs(r.saldo)}</td>
+              </tr>
+            ))}
+            {porDia.length === 0 && (
+              <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-400">No hay actividad en el período seleccionado.</td></tr>
+            )}
+          </tbody>
+          {porDia.length > 0 && (
+            <tfoot className="bg-slate-50 font-semibold">
+              <tr className="border-t border-slate-200">
+                <td className="px-4 py-2.5 text-slate-700">Total del período</td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-slate-800">{formatGs(totalVendido)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-emerald-700">{formatGs(ingresos)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-rose-600">{formatGs(egresos)}</td>
+                <td className={`px-4 py-2.5 text-right tabular-nums ${ingresos - egresos >= 0 ? 'text-slate-800' : 'text-rose-600'}`}>{formatGs(ingresos - egresos)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-slate-500">{formatGs(saldoAlCierre)}</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+
+/* ------------------------------------------------------------
+   10b. SUELDOS (empleados + pagos/adelantos con filtro por fechas)
+   Usa la misma colección "pagosPersonal" que la pestaña "Pago de
+   Personal" de Caja, así no hay datos duplicados.
+   ------------------------------------------------------------ */
+function EmpleadosTab() {
+  const { empleados, addEmpleado, updateEmpleado, deleteEmpleado, pagosPersonal } = useData();
+  const [form, setForm] = useState({ nombre: '', cargo: '', sueldo_base: '', frecuencia: 'Mensual' });
+
+  const agregar = () => {
+    if (!form.nombre.trim() || !form.sueldo_base) return;
+    addEmpleado({ nombre: form.nombre.trim(), cargo: form.cargo.trim(), sueldo_base: Number(form.sueldo_base), frecuencia: form.frecuencia });
+    setForm({ nombre: '', cargo: '', sueldo_base: '', frecuencia: 'Mensual' });
+  };
+
+  // Costo mensual estimado de la nómina (para comparar con los costos fijos).
+  const factor = { Semanal: 4.33, Quincenal: 2, Mensual: 1 };
+  const nominaMensual = empleados.filter((e) => e.activo !== false).reduce((s, e) => s + e.sueldo_base * (factor[e.frecuencia] || 1), 0);
+
+  const mk = monthKey(new Date());
+  const pagadoEsteMes = (emp) => pagosPersonal.filter((p) => (p.empleado_id === emp.id || p.empleado === emp.nombre) && p.fecha.slice(0, 7) === mk).reduce((s, p) => s + p.monto, 0);
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <h3 className="text-sm font-semibold text-slate-700 mb-3">Agregar empleado</h3>
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+          <Field label="Nombre" required>
+            <input className={inputCls} value={form.nombre} onChange={(e) => setForm({ ...form, nombre: e.target.value })} />
+          </Field>
+          <Field label="Cargo">
+            <input className={inputCls} placeholder="Ej: Atención, Producción" value={form.cargo} onChange={(e) => setForm({ ...form, cargo: e.target.value })} />
+          </Field>
+          <Field label="Sueldo base (Gs.)" required>
+            <input type="number" className={inputCls} value={form.sueldo_base} onChange={(e) => setForm({ ...form, sueldo_base: e.target.value })} />
+          </Field>
+          <Field label="Frecuencia">
+            <select className={inputCls} value={form.frecuencia} onChange={(e) => setForm({ ...form, frecuencia: e.target.value })}>
+              {FRECUENCIAS_SUELDO.map((f) => <option key={f}>{f}</option>)}
+            </select>
+          </Field>
+          <div className="flex items-end"><Button className="w-full" onClick={agregar}><Plus size={15} /> Agregar</Button></div>
+        </div>
+      </Card>
+
+      <div className="flex flex-wrap gap-4 text-sm">
+        <span className="text-slate-500">Empleados activos: <b className="text-slate-800 tabular-nums">{empleados.filter((e) => e.activo !== false).length}</b></span>
+        <span className="text-slate-500">Nómina mensual estimada: <b className="text-rose-600 tabular-nums">{formatGs(nominaMensual)}</b></span>
+      </div>
+
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
+            <tr>
+              <th className="text-left px-4 py-2.5">Nombre</th>
+              <th className="text-left px-4 py-2.5">Cargo</th>
+              <th className="text-right px-4 py-2.5">Sueldo base</th>
+              <th className="text-left px-4 py-2.5">Frecuencia</th>
+              <th className="text-right px-4 py-2.5">Pagado este mes</th>
+              <th className="text-center px-4 py-2.5">Activo</th>
+              <th className="px-4 py-2.5"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {empleados.map((e) => (
+              <tr key={e.id} className={`border-t border-slate-100 ${e.activo === false ? 'opacity-50' : ''}`}>
+                <td className="px-4 py-2.5"><input className={`${inputTableText} font-medium text-slate-700`} value={e.nombre} onChange={(ev) => updateEmpleado(e.id, { nombre: ev.target.value })} /></td>
+                <td className="px-4 py-2.5"><input className={inputTableText} value={e.cargo || ''} onChange={(ev) => updateEmpleado(e.id, { cargo: ev.target.value })} /></td>
+                <td className="px-4 py-2.5 text-right"><input type="number" className={`${inputSm} w-28`} value={e.sueldo_base} onChange={(ev) => updateEmpleado(e.id, { sueldo_base: Number(ev.target.value) })} /></td>
+                <td className="px-4 py-2.5">
+                  <select className={`${inputTableText} min-w-[7rem]`} value={e.frecuencia} onChange={(ev) => updateEmpleado(e.id, { frecuencia: ev.target.value })}>
+                    {FRECUENCIAS_SUELDO.map((f) => <option key={f}>{f}</option>)}
+                  </select>
+                </td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-rose-600 font-medium">{formatGs(pagadoEsteMes(e))}</td>
+                <td className="px-4 py-2.5 text-center">
+                  <input type="checkbox" checked={e.activo !== false} onChange={(ev) => updateEmpleado(e.id, { activo: ev.target.checked })} className="accent-emerald-700" />
+                </td>
+                <td className="px-4 py-2.5 text-right">
+                  <button onClick={() => deleteEmpleado(e.id)} title="Eliminar empleado" className="text-slate-400 hover:text-rose-600"><Trash2 size={15} /></button>
+                </td>
+              </tr>
+            ))}
+            {empleados.length === 0 && (
+              <tr><td colSpan={7} className="px-4 py-6 text-center text-slate-400">Todavía no cargaste empleados.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+function PagosSueldoTab() {
+  const { empleados, pagosPersonal, registrarPagoPersonal, updatePagoPersonal, deletePagoPersonal } = useData();
+  const activos = empleados.filter((e) => e.activo !== false);
+  const rango = useRangoFechas('mes');
+  const [confirmacion, setConfirmacion] = useState('');
+  const vacio = { empleadoId: '', empleado: '', fecha: todayISO(), concepto: CONCEPTOS_PERSONAL[0], monto: '', metodoPago: 'Efectivo', periodo: '', nota: '' };
+  const [form, setForm] = useState(vacio);
+
+  // Al elegir empleado, precarga el sueldo base como monto sugerido.
+  const elegirEmpleado = (id) => {
+    const e = empleados.find((x) => String(x.id) === String(id));
+    setForm({ ...form, empleadoId: id, empleado: e ? e.nombre : '', monto: e && !form.monto ? e.sueldo_base : form.monto });
+  };
+
+  const guardar = () => {
+    const nombre = form.empleado.trim();
+    if (!nombre || !Number(form.monto) || !form.fecha) return;
+    registrarPagoPersonal({
+      fecha: form.fecha, empleado: nombre, concepto: form.concepto, monto: Number(form.monto), nota: form.nota.trim(),
+      empleadoId: form.empleadoId ? Number(form.empleadoId) : null, metodoPago: form.metodoPago, periodo: form.periodo.trim(),
+    });
+    setConfirmacion(`${form.concepto} registrado: ${formatGs(Number(form.monto))} a ${nombre}`);
+    setForm(vacio);
+    setTimeout(() => setConfirmacion(''), 3500);
+  };
+
+  const filtrados = pagosPersonal
+    .filter((p) => enRango(p.fecha, rango.desde, rango.hasta))
+    .sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+  const esAdelanto = (p) => p.concepto === 'Adelanto';
+  const totalSueldos = filtrados.filter((p) => !esAdelanto(p)).reduce((s, p) => s + p.monto, 0);
+  const totalAdelantos = filtrados.filter(esAdelanto).reduce((s, p) => s + p.monto, 0);
+
+  const porEmpleado = useMemo(() => {
+    const map = {};
+    filtrados.forEach((p) => {
+      if (!map[p.empleado]) map[p.empleado] = { nombre: p.empleado, sueldos: 0, adelantos: 0 };
+      if (esAdelanto(p)) map[p.empleado].adelantos += p.monto; else map[p.empleado].sueldos += p.monto;
+    });
+    return Object.values(map);
+  }, [filtrados]);
+
+  const mediosPago = METODOS_PAGO.filter((m) => m !== 'Crédito' && m !== 'POS');
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <h3 className="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><Banknote size={16} className="text-emerald-700" /> Registrar pago de sueldo o adelanto</h3>
+        {confirmacion && (
+          <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 text-sm rounded-lg px-4 py-2.5 flex items-center gap-2 mb-4"><Check size={15} /> {confirmacion}</div>
+        )}
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <Field label="Empleado" required>
+              {activos.length > 0 ? (
+                <select className={inputCls} value={form.empleadoId} onChange={(e) => elegirEmpleado(e.target.value)}>
+                  <option value="">Seleccionar...</option>
+                  {activos.map((e) => <option key={e.id} value={e.id}>{e.nombre}</option>)}
+                </select>
+              ) : (
+                <input className={inputCls} placeholder="Nombre (o cargá empleados en la otra pestaña)" value={form.empleado} onChange={(e) => setForm({ ...form, empleado: e.target.value })} />
+              )}
+            </Field>
+            <Field label="Concepto" required>
+              <select className={inputCls} value={form.concepto} onChange={(e) => setForm({ ...form, concepto: e.target.value })}>
+                {CONCEPTOS_PERSONAL.map((c) => <option key={c}>{c}</option>)}
+              </select>
+            </Field>
+            <Field label="Monto (Gs.)" required>
+              <input type="number" className={inputCls} value={form.monto} onChange={(e) => setForm({ ...form, monto: e.target.value })} />
+            </Field>
+            <Field label="Fecha de pago" required>
+              <input type="date" className={inputCls} value={form.fecha} onChange={(e) => setForm({ ...form, fecha: e.target.value })} />
+            </Field>
+          </div>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <Field label="Medio de pago">
+              <select className={inputCls} value={form.metodoPago} onChange={(e) => setForm({ ...form, metodoPago: e.target.value })}>
+                {mediosPago.map((m) => <option key={m}>{m}</option>)}
+              </select>
+            </Field>
+            <Field label="Período que cubre">
+              <input className={inputCls} placeholder="Ej: 1ª quincena nov" value={form.periodo} onChange={(e) => setForm({ ...form, periodo: e.target.value })} />
+            </Field>
+            <Field label="Nota">
+              <input className={inputCls} value={form.nota} onChange={(e) => setForm({ ...form, nota: e.target.value })} />
+            </Field>
+            <div className="flex items-end"><Button className="w-full" onClick={guardar}>Registrar pago</Button></div>
+          </div>
+          <p className="text-xs text-slate-400">Cada pago genera automáticamente el egreso de caja en la categoría "Sueldos" y aparece también en Caja → Pago de Personal.</p>
+        </div>
+      </Card>
+
+      <Card className="p-4">
+        <SelectorFechas rango={rango} />
+      </Card>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <Card className="p-4"><div className="text-xs text-slate-500 mb-1">Sueldos y otros conceptos</div><div className="text-lg font-bold text-rose-600 tabular-nums">{formatGs(totalSueldos)}</div></Card>
+        <Card className="p-4"><div className="text-xs text-slate-500 mb-1">Adelantos</div><div className="text-lg font-bold text-amber-600 tabular-nums">{formatGs(totalAdelantos)}</div></Card>
+        <Card className="p-4"><div className="text-xs text-slate-500 mb-1">Total nómina del período</div><div className="text-lg font-bold text-slate-800 tabular-nums">{formatGs(totalSueldos + totalAdelantos)}</div></Card>
+      </div>
+
+      {porEmpleado.length > 0 && (
+        <Card className="p-5">
+          <h3 className="text-sm font-semibold text-slate-700 mb-3">Resumen por empleado</h3>
+          <div className="space-y-2">
+            {porEmpleado.map((r) => (
+              <div key={r.nombre} className="flex items-center justify-between text-sm border-b border-slate-100 pb-2 last:border-0">
+                <span className="font-medium text-slate-700">{r.nombre}</span>
+                <span className="text-xs text-slate-500 tabular-nums">Sueldos {formatGs(r.sueldos)} · Adelantos {formatGs(r.adelantos)} · <b className="text-slate-800">{formatGs(r.sueldos + r.adelantos)}</b></span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      <Card className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
+            <tr>
+              <th className="text-left px-4 py-2.5">Fecha</th>
+              <th className="text-left px-4 py-2.5">Empleado</th>
+              <th className="text-left px-4 py-2.5">Concepto</th>
+              <th className="text-left px-4 py-2.5">Período</th>
+              <th className="text-left px-4 py-2.5">Medio</th>
+              <th className="text-right px-4 py-2.5">Monto</th>
+              <th className="px-4 py-2.5"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtrados.map((p) => (
+              <tr key={p.id} className="border-t border-slate-100">
+                <td className="px-4 py-2.5"><input type="date" className={inputTableText} value={p.fecha} onChange={(e) => updatePagoPersonal(p.id, { fecha: e.target.value })} /></td>
+                <td className="px-4 py-2.5"><input className={inputTableText} value={p.empleado} onChange={(e) => updatePagoPersonal(p.id, { empleado: e.target.value })} /></td>
+                <td className="px-4 py-2.5">
+                  <select className={`${inputTableText} min-w-[8rem]`} value={p.concepto} onChange={(e) => updatePagoPersonal(p.id, { concepto: e.target.value })}>
+                    {CONCEPTOS_PERSONAL.map((c) => <option key={c}>{c}</option>)}
+                  </select>
+                </td>
+                <td className="px-4 py-2.5"><input className={inputTableText} value={p.periodo || ''} onChange={(e) => updatePagoPersonal(p.id, { periodo: e.target.value })} /></td>
+                <td className="px-4 py-2.5">
+                  <select className={`${inputTableText} min-w-[7rem]`} value={p.metodo_pago || 'Efectivo'} onChange={(e) => updatePagoPersonal(p.id, { metodo_pago: e.target.value })}>
+                    {mediosPago.map((m) => <option key={m}>{m}</option>)}
+                  </select>
+                </td>
+                <td className="px-4 py-2.5 text-right"><input type="number" className={`${inputSm} w-28`} value={p.monto} onChange={(e) => updatePagoPersonal(p.id, { monto: Number(e.target.value) })} /></td>
+                <td className="px-4 py-2.5 text-right">
+                  <button onClick={() => deletePagoPersonal(p.id)} title="Eliminar pago" className="text-slate-400 hover:text-rose-600"><Trash2 size={15} /></button>
+                </td>
+              </tr>
+            ))}
+            {filtrados.length === 0 && (
+              <tr><td colSpan={7} className="px-4 py-6 text-center text-slate-400">No hay pagos en el período seleccionado.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+function SueldosPage() {
+  const [tab, setTab] = useState('Pagos');
+  const tabs = [
+    { id: 'Pagos', label: 'Pagos y Adelantos' },
+    { id: 'Empleados', label: 'Empleados' },
+  ];
+  return (
+    <div className="space-y-5">
+      <div>
+        <h2 className="text-xl font-semibold text-slate-800">Sueldos</h2>
+        <p className="text-sm text-slate-500">Empleados, pagos de sueldo y adelantos. Cada pago impacta automáticamente en Caja y en el Flujo de Caja.</p>
+      </div>
+      <div className="flex gap-2 border-b border-slate-200">
+        {tabs.map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              tab === t.id ? 'border-emerald-700 text-emerald-700' : 'border-transparent text-slate-500 hover:text-slate-700'
+            }`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {tab === 'Pagos' && <PagosSueldoTab />}
+      {tab === 'Empleados' && <EmpleadosTab />}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------
    11. AJUSTES
    ------------------------------------------------------------ */
 function AjustesPage() {
   const data = useData();
-  const { config, updateConfig, productos, contactos, ventas, compras, movimientos, cuentasCobrar, cuentasPagar, pagosPersonal } = data;
+  const { config, updateConfig, productos, contactos, ventas, compras, movimientos, cuentasCobrar, cuentasPagar, pagosPersonal, empleados } = data;
   const [form, setForm] = useState({
     metaPE: config.metaPE,
     costosFijos: config.costosFijos,
     cajaInicial: config.cajaInicial,
     costoInsumoBase: config.costoInsumoBase,
   });
+  const [comisiones, setComisiones] = useState({ ...config.comisiones });
   const [mensaje, setMensaje] = useState('');
   const fileInputRef = useRef(null);
 
@@ -2420,13 +3186,14 @@ function AjustesPage() {
       costosFijos: Number(form.costosFijos),
       cajaInicial: Number(form.cajaInicial),
       costoInsumoBase: Number(form.costoInsumoBase),
+      comisiones: Object.fromEntries(METODOS_PAGO.map((m) => [m, Number(comisiones[m]) || 0])),
     });
     setMensaje('Parámetros del negocio actualizados correctamente.');
     setTimeout(() => setMensaje(''), 3000);
   };
 
   const exportar = () => {
-    const backup = { productos, contactos, ventas, compras, movimientos, cuentasCobrar, cuentasPagar, config, pagosPersonal };
+    const backup = { productos, contactos, ventas, compras, movimientos, cuentasCobrar, cuentasPagar, config, pagosPersonal, empleados };
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -2481,6 +3248,18 @@ function AjustesPage() {
             <input type="number" className={inputCls} value={form.costoInsumoBase} onChange={(e) => setForm({ ...form, costoInsumoBase: e.target.value })} />
           </Field>
         </div>
+        <div className="pt-2 border-t border-slate-200">
+          <h4 className="text-xs font-semibold text-slate-600 mb-1">Comisiones por medio de pago (%)</h4>
+          <p className="text-xs text-slate-400 mb-3">Lo que te descuenta el posnet o la billetera por cada cobro. Se registra automáticamente como egreso "Comisión Medio de Pago" al confirmar la venta.</p>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {METODOS_PAGO.filter((m) => m !== 'Crédito').map((m) => (
+              <Field key={m} label={m}>
+                <input type="number" step="0.1" min="0" className={inputCls} value={comisiones[m] ?? 0}
+                  onChange={(e) => setComisiones({ ...comisiones, [m]: e.target.value })} />
+              </Field>
+            ))}
+          </div>
+        </div>
         <Button onClick={guardarConfig}>Guardar parámetros</Button>
       </Card>
 
@@ -2510,6 +3289,8 @@ function AppContent() {
     productos: <ProductosPage />,
     compras: <ComprasPage />,
     caja: <CajaPage />,
+    flujo: <FlujoCajaPage />,
+    sueldos: <SueldosPage />,
     reportes: <ReportesPage />,
     ajustes: <AjustesPage />,
   };

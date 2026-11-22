@@ -182,6 +182,8 @@ const MOCK_CONFIG = {
   // "Comisión Medio de Pago" al confirmar la venta, así el flujo de caja
   // refleja lo que realmente entra. Editable desde Ajustes.
   comisiones: { Efectivo: 0, Transferencia: 0, POS: 4, 'QR / Billetera': 1.5, Crédito: 0 },
+  // Interruptor general: mientras esté apagado no se descuenta ninguna comisión.
+  comisionesActivas: false,
 };
 
 // Métodos de pago del POS. "POS" = tarjeta débito/crédito por posnet;
@@ -268,7 +270,14 @@ function DataProvider({ children }) {
     () => ({ ...MOCK_CONFIG, ...configRaw, comisiones: { ...MOCK_CONFIG.comisiones, ...(configRaw?.comisiones || {}) } }),
     [configRaw]
   );
-  const comisionDe = (metodo) => Number(config.comisiones?.[metodo] || 0);
+  const comisionDe = (metodo) => (config.comisionesActivas ? Number(config.comisiones?.[metodo] || 0) : 0);
+
+  // Borra los egresos de comisión que se generaron automáticamente en ventas.
+  const borrarComisionesRegistradas = () => {
+    const n = movimientos.filter((m) => m.comision_venta).length;
+    setMovimientos((prev) => prev.filter((m) => !m.comision_venta));
+    return n;
+  };
 
   const listo = l1 && l2 && l3 && l4 && l5 && l6 && l7 && l8 && l9 && l10;
 
@@ -286,6 +295,62 @@ function DataProvider({ children }) {
 
   const deleteProducto = (id) => setProductos((prev) => prev.filter((p) => p.id !== id));
 
+  // Suma/resta stock por id de producto: deltas = { [id]: +/-unidades }.
+  const ajustarStock = (deltas) => {
+    const ids = Object.keys(deltas).filter((k) => deltas[k]);
+    if (!ids.length) return;
+    setProductos((prev) =>
+      prev.map((p) => (deltas[p.id] ? { ...p, stock: Math.max(0, (Number(p.stock) || 0) + deltas[p.id]) } : p))
+    );
+  };
+  const sumarDelta = (deltas, id, n) => { if (id != null && n) deltas[id] = (deltas[id] || 0) + n; };
+
+  // Une dos productos en uno: el stock del origen se suma al destino, su precio
+  // queda como precio alternativo del destino, y las ventas y compras pasan al
+  // destino conservando el precio con que se vendieron. Luego se borra el origen.
+  const fusionarProductos = (destinoId, origenId) => {
+    const destino = productos.find((p) => p.id === destinoId);
+    const origen = productos.find((p) => p.id === origenId);
+    if (!destino || !origen || destinoId === origenId) return;
+    const stockOrigen = origen.stock_base_id ? 0 : Number(origen.stock) || 0;
+    const extras = [...(destino.precios_extra || [])];
+    [origen.precio_b2c, ...(origen.precios_extra || [])].forEach((pr) => {
+      if (pr && pr !== destino.precio_b2c && !extras.includes(pr)) extras.push(pr);
+    });
+    setProductos((prev) =>
+      prev
+        .filter((p) => p.id !== origenId)
+        .map((p) => {
+          if (p.id === destinoId) return { ...p, stock: (Number(p.stock) || 0) + stockOrigen, precios_extra: extras.sort((a, b) => a - b) };
+          if (p.stock_base_id === origenId) return { ...p, stock_base_id: destinoId };
+          return p;
+        })
+    );
+    setVentas((prev) =>
+      prev.map((v) => {
+        let nv = v;
+        if (v.producto_id === origenId) nv = { ...nv, producto_id: destinoId, precio_fijo: true };
+        if (consumoDeVenta(v).id === origenId) nv = { ...nv, stock_id: destinoId, unidades_stock: consumoDeVenta(v).unidades };
+        return nv;
+      })
+    );
+    setCompras((prev) => prev.map((c) => (c.producto_id === origenId ? { ...c, producto_id: destinoId } : c)));
+  };
+
+  // Vincula un producto al stock de otro (o lo desvincula con baseId = null).
+  // Si traspasar es true, las unidades que tenía el producto pasan al stock base.
+  const vincularStock = (id, baseId, unidades = 1, traspasar = false) => {
+    setProductos((prev) => {
+      const prod = prev.find((p) => p.id === id);
+      const mover = traspasar && baseId ? Number(prod?.stock) || 0 : 0;
+      return prev.map((p) => {
+        if (p.id === id) return { ...p, stock_base_id: baseId || null, unidades_stock: Math.max(1, Number(unidades) || 1), stock: mover ? 0 : p.stock };
+        if (mover && p.id === baseId) return { ...p, stock: (Number(p.stock) || 0) + mover };
+        return p;
+      });
+    });
+  };
+
   // Registra una compra a un proveedor: guarda el detalle (insumo como texto libre,
   // así podés anotar cualquier cosa: pajitas, hielo, decorativos, etc.) y genera el
   // egreso de caja correspondiente, vinculado a la compra (compra_id) para que
@@ -294,6 +359,8 @@ function DataProvider({ children }) {
     const costoTotal = cantidad * costoUnitario;
     const compraId = nextId(compras);
     const movId = nextId(movimientos);
+    // Si eligieron un producto que usa stock compartido, la compra va al stock base.
+    if (productoId) productoId = fuenteStock(productos, productoId).id;
 
     setCompras((prev) => [
       ...prev,
@@ -317,6 +384,7 @@ function DataProvider({ children }) {
     const old = compras.find((c) => c.id === id);
     if (!old) return;
     const merged = { ...old, ...patch };
+    if (patch.producto_id) merged.producto_id = fuenteStock(productos, patch.producto_id).id;
     merged.costo_total = merged.cantidad * merged.costo_unitario;
 
     setCompras((prev) => prev.map((c) => (c.id === id ? merged : c)));
@@ -369,22 +437,24 @@ function DataProvider({ children }) {
     items.forEach((item) => {
       const prod = productos.find((p) => p.id === item.producto_id);
       if (!prod) return;
-      const precioUnit = canal === 'B2B' ? prod.precio_b2b : prod.precio_b2c;
+      // item.precio = precio elegido en el POS (ej. Coco a 30.000); si no, el del canal.
+      const precioUnit = item.precio != null ? Number(item.precio) : canal === 'B2B' ? prod.precio_b2b : prod.precio_b2c;
       const total = precioUnit * item.cantidad;
       const costo = prod.costo_variable * item.cantidad;
       totalVenta += total;
+      const f = fuenteStock(productos, prod);
       lineas.push({
         producto_id: item.producto_id, nombreProd: prod.nombre, cantidad: item.cantidad,
         precio_unitario: precioUnit, total, costo_total: costo, margen: total - costo,
+        stock_id: f.id, unidades_stock: item.cantidad * f.factor,
+        precio_fijo: item.precio != null,
       });
     });
 
-    setProductos((prev) =>
-      prev.map((p) => {
-        const item = items.find((i) => i.producto_id === p.id);
-        return item ? { ...p, stock: Math.max(0, p.stock - item.cantidad) } : p;
-      })
-    );
+    // Descuenta del stock correspondiente (propio o compartido).
+    const deltasVenta = {};
+    lineas.forEach((l) => sumarDelta(deltasVenta, l.stock_id, -l.unidades_stock));
+    ajustarStock(deltasVenta);
 
     let ventaId = nextId(ventas);
     let cxcId = nextId(cuentasCobrar);
@@ -398,6 +468,8 @@ function DataProvider({ children }) {
       nuevasVentas.push({
         id, fecha: fechaVenta, canal, producto_id: l.producto_id, cantidad: l.cantidad,
         precio_unitario: l.precio_unitario, total: l.total, costo_total: l.costo_total, margen: l.margen,
+        stock_id: l.stock_id, unidades_stock: l.unidades_stock,
+        ...(l.precio_fijo ? { precio_fijo: true } : {}),
         metodo_pago: metodoPago, contacto_id: contactoId || null,
         estado_cobro: metodoPago === 'Crédito' ? 'Pendiente' : 'Cobrado',
       });
@@ -443,23 +515,37 @@ function DataProvider({ children }) {
     if (!old) return;
     const merged = { ...old, ...patch };
     const prod = productos.find((p) => p.id === merged.producto_id);
+    // Precio elegido a mano (patch.precio_unitario) o venta hecha con un precio
+    // alternativo: se respeta ese precio. Si cambia el producto, vuelve al del canal.
+    if (patch.precio_unitario != null) merged.precio_fijo = true;
+    if (patch.producto_id != null && patch.producto_id !== old.producto_id) merged.precio_fijo = false;
     if (prod) {
-      merged.precio_unitario = merged.canal === 'B2B' ? prod.precio_b2b : prod.precio_b2c;
+      merged.precio_unitario = merged.precio_fijo
+        ? Number(merged.precio_unitario)
+        : merged.canal === 'B2B' ? prod.precio_b2b : prod.precio_b2c;
       merged.total = merged.precio_unitario * merged.cantidad;
       merged.costo_total = prod.costo_variable * merged.cantidad;
       merged.margen = merged.total - merged.costo_total;
     }
 
+    // Si cambió el producto o la cantidad, se recalcula de qué stock sale.
+    if (merged.producto_id !== old.producto_id || merged.cantidad !== old.cantidad) {
+      const f = fuenteStock(productos, merged.producto_id);
+      merged.stock_id = f.id;
+      merged.unidades_stock = merged.cantidad * f.factor;
+    }
+
     setVentas((prev) => prev.map((v) => (v.id === id ? merged : v)));
 
-    setProductos((prev) =>
-      prev.map((p) => {
-        let stock = p.stock;
-        if (p.id === old.producto_id) stock -= old.cantidad;
-        if (p.id === merged.producto_id) stock += merged.cantidad;
-        return stock !== p.stock ? { ...p, stock: Math.max(0, stock) } : p;
-      })
-    );
+    // Devuelve lo que consumía la venta original y descuenta lo nuevo.
+    const cOld = consumoDeVenta(old);
+    const cNew = consumoDeVenta(merged);
+    if (cOld.id !== cNew.id || cOld.unidades !== cNew.unidades) {
+      const d = {};
+      sumarDelta(d, cOld.id, cOld.unidades);
+      sumarDelta(d, cNew.id, -cNew.unidades);
+      ajustarStock(d);
+    }
 
     setMovimientos((prev) =>
       prev.map((m) => (m.venta_id === id ? { ...m, fecha: merged.fecha, monto: merged.total } : m))
@@ -475,9 +561,8 @@ function DataProvider({ children }) {
     const old = ventas.find((v) => v.id === id);
     if (!old) return;
     setVentas((prev) => prev.filter((v) => v.id !== id));
-    setProductos((prev) =>
-      prev.map((p) => (p.id === old.producto_id ? { ...p, stock: p.stock + old.cantidad } : p))
-    );
+    const c = consumoDeVenta(old);
+    ajustarStock({ [c.id]: c.unidades });
     setMovimientos((prev) => prev.filter((m) => m.venta_id !== id));
     setCuentasCobrar((prev) => prev.filter((c) => c.venta_id !== id));
   };
@@ -564,7 +649,7 @@ function DataProvider({ children }) {
   const value = {
     productos, contactos, ventas, compras, movimientos, cuentasCobrar, cuentasPagar, config, pagosPersonal, empleados,
     registrarPagoPersonal, updatePagoPersonal, deletePagoPersonal,
-    addEmpleado, updateEmpleado, deleteEmpleado, comisionDe,
+    addEmpleado, updateEmpleado, deleteEmpleado, comisionDe, vincularStock, borrarComisionesRegistradas, fusionarProductos,
     nombreContacto, updateProducto, addProducto, deleteProducto, registrarVentaCarrito, updateVenta, deleteVenta,
     addMovimiento, updateMovimiento, deleteMovimiento,
     addContacto, updateContacto, deleteContacto, registrarCompra, updateCompra, deleteCompra,
@@ -967,9 +1052,60 @@ function margenPct(precio, costo) {
   return ((precio - costo) / precio) * 100;
 }
 
+// Une dos productos que en realidad son el mismo (ej. "Coco 25.000" y
+// "Coco 30.000") en uno solo con un solo stock y dos precios.
+function UnirProductosCard() {
+  const { productos, fusionarProductos } = useData();
+  const [destino, setDestino] = useState('');
+  const [origen, setOrigen] = useState('');
+  const [mensaje, setMensaje] = useState('');
+  const pDestino = productos.find((p) => p.id === Number(destino));
+  const pOrigen = productos.find((p) => p.id === Number(origen));
+
+  const unir = () => {
+    if (!pDestino || !pOrigen || pDestino.id === pOrigen.id) return;
+    const ok = window.confirm(
+      `Se va a unir "${pOrigen.nombre}" dentro de "${pDestino.nombre}":\n\n` +
+      `• Stock: ${pDestino.stock} + ${pOrigen.stock} = ${(Number(pDestino.stock) || 0) + (Number(pOrigen.stock) || 0)}\n` +
+      `• ${formatGs(pOrigen.precio_b2c)} queda como otro precio de "${pDestino.nombre}"\n` +
+      `• Las ventas y compras de "${pOrigen.nombre}" pasan a "${pDestino.nombre}" con su mismo precio\n` +
+      `• "${pOrigen.nombre}" se elimina del catálogo\n\n¿Continuar?`
+    );
+    if (!ok) return;
+    fusionarProductos(pDestino.id, pOrigen.id);
+    setMensaje(`Listo: "${pOrigen.nombre}" se unió a "${pDestino.nombre}".`);
+    setOrigen('');
+    setTimeout(() => setMensaje(''), 4000);
+  };
+
+  return (
+    <Card className="p-5">
+      <h3 className="text-sm font-semibold text-slate-700 mb-1 flex items-center gap-2"><Package size={16} className="text-emerald-700" /> Unir productos repetidos</h3>
+      <p className="text-xs text-slate-400 mb-3">Si tenés el mismo producto cargado dos veces con distinto precio (ej. Coco 25.000 y Coco 30.000), unilos en uno: un solo stock y los dos precios disponibles en el POS.</p>
+      {mensaje && <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 text-sm rounded-lg px-4 py-2 flex items-center gap-2 mb-3"><Check size={15} /> {mensaje}</div>}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+        <Field label="Producto que queda">
+          <select className={inputCls} value={destino} onChange={(e) => setDestino(e.target.value)}>
+            <option value="">Seleccionar...</option>
+            {productos.map((p) => <option key={p.id} value={p.id}>{p.nombre} ({formatGs(p.precio_b2c)} · stock {p.stock})</option>)}
+          </select>
+        </Field>
+        <Field label="Producto que se une y desaparece">
+          <select className={inputCls} value={origen} onChange={(e) => setOrigen(e.target.value)}>
+            <option value="">Seleccionar...</option>
+            {productos.filter((p) => String(p.id) !== String(destino)).map((p) => <option key={p.id} value={p.id}>{p.nombre} ({formatGs(p.precio_b2c)} · stock {p.stock})</option>)}
+          </select>
+        </Field>
+        <Button onClick={unir} disabled={!pDestino || !pOrigen}>Unir productos</Button>
+      </div>
+    </Card>
+  );
+}
+
 function NuevoProductoModal({ open, onClose }) {
   const { addProducto } = useData();
-  const [form, setForm] = useState({ nombre: '', precio_b2c: '', precio_b2b: '', costo_variable: '', stock: '', categoria: '', canal_objetivo: 'B2C' });
+  const vacio = { nombre: '', precio_b2c: '', precio_b2b: '', costo_variable: '', stock: '', categoria: '', canal_objetivo: 'B2C', precio_extra: '' };
+  const [form, setForm] = useState(vacio);
 
   const guardar = () => {
     if (!form.nombre || !form.precio_b2c || !form.costo_variable) return;
@@ -981,8 +1117,9 @@ function NuevoProductoModal({ open, onClose }) {
       precio_b2b: Number(form.precio_b2b) || Number(form.precio_b2c),
       costo_variable: Number(form.costo_variable),
       stock: Number(form.stock) || 0,
+      precios_extra: Number(form.precio_extra) && Number(form.precio_extra) !== Number(form.precio_b2c) ? [Number(form.precio_extra)] : [],
     });
-    setForm({ nombre: '', precio_b2c: '', precio_b2b: '', costo_variable: '', stock: '', categoria: '', canal_objetivo: 'B2C' });
+    setForm(vacio);
     onClose();
   };
 
@@ -1018,6 +1155,10 @@ function NuevoProductoModal({ open, onClose }) {
             <input type="number" className={inputCls} value={form.stock} onChange={(e) => setForm({ ...form, stock: e.target.value })} />
           </Field>
         </div>
+        <Field label="Otro precio de venta (opcional)">
+          <input type="number" className={inputCls} placeholder="Ej: 30000 — descuenta del mismo stock" value={form.precio_extra}
+            onChange={(e) => setForm({ ...form, precio_extra: e.target.value })} />
+        </Field>
         <Button className="w-full mt-2" onClick={guardar}>Guardar producto</Button>
       </div>
     </Modal>
@@ -1074,13 +1215,25 @@ function CalculadoraMargen({ productos }) {
 function ProductosPage() {
   const { productos, updateProducto, deleteProducto } = useData();
   const [open, setOpen] = useState(false);
+  const [nuevoPrecio, setNuevoPrecio] = useState({}); // { [productoId]: '30000' }
+
+  const agregarPrecio = (p) => {
+    const valor = Number(nuevoPrecio[p.id]);
+    if (!valor) return;
+    const actuales = p.precios_extra || [];
+    if (valor !== p.precio_b2c && !actuales.includes(valor)) {
+      updateProducto(p.id, 'precios_extra', [...actuales, valor].sort((a, b) => a - b));
+    }
+    setNuevoPrecio({ ...nuevoPrecio, [p.id]: '' });
+  };
+  const quitarPrecio = (p, valor) => updateProducto(p.id, 'precios_extra', (p.precios_extra || []).filter((x) => x !== valor));
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-semibold text-slate-800">Catálogo y Costeo</h2>
-          <p className="text-sm text-slate-500">Editá nombre, categoría, canal, costos y precios directamente en la tabla.</p>
+          <p className="text-sm text-slate-500">Editá nombre, categoría, canal, costos y precios directamente en la tabla. En "Otros precios" agregás precios alternativos (ej. Coco a 25.000 y a 30.000) que descuentan del mismo stock.</p>
         </div>
         <Button onClick={() => setOpen(true)}><Plus size={16} /> Agregar Nuevo Producto</Button>
       </div>
@@ -1095,6 +1248,7 @@ function ProductosPage() {
               <th className="text-right px-4 py-2.5">Costo Variable</th>
               <th className="text-right px-4 py-2.5">Precio B2C</th>
               <th className="text-right px-4 py-2.5">Precio B2B</th>
+              <th className="text-left px-4 py-2.5">Otros precios</th>
               <th className="text-right px-4 py-2.5">Stock</th>
               <th className="text-center px-4 py-2.5">Margen B2C</th>
               <th className="text-center px-4 py-2.5">Margen B2B</th>
@@ -1133,9 +1287,29 @@ function ProductosPage() {
                     <input type="number" className={inputSm} value={p.precio_b2b}
                       onChange={(e) => updateProducto(p.id, 'precio_b2b', Number(e.target.value))} />
                   </td>
+                  <td className="px-4 py-2.5">
+                    <div className="flex flex-wrap items-center gap-1.5 min-w-[11rem]">
+                      {(p.precios_extra || []).map((pr) => (
+                        <span key={pr} className="inline-flex items-center gap-1 bg-emerald-50 text-emerald-800 text-xs font-medium rounded-full pl-2 pr-1 py-0.5 tabular-nums">
+                          {formatGs(pr)}
+                          <button onClick={() => quitarPrecio(p, pr)} title="Quitar precio" className="text-emerald-600 hover:text-rose-600"><X size={12} /></button>
+                        </span>
+                      ))}
+                      <input type="number" placeholder="+ precio" className={`${inputSm} w-24`} value={nuevoPrecio[p.id] || ''}
+                        onChange={(e) => setNuevoPrecio({ ...nuevoPrecio, [p.id]: e.target.value })}
+                        onKeyDown={(e) => { if (e.key === 'Enter') agregarPrecio(p); }}
+                        onBlur={() => agregarPrecio(p)} />
+                    </div>
+                  </td>
                   <td className="px-4 py-2.5 text-right">
-                    <input type="number" className={inputSm} value={p.stock}
-                      onChange={(e) => updateProducto(p.id, 'stock', Number(e.target.value))} />
+                    {p.stock_base_id && baseDeStock(productos, p) ? (
+                      <span className="text-xs text-slate-500 tabular-nums" title={`Usa el stock de ${baseDeStock(productos, p).nombre}`}>
+                        {stockDisponible(productos, p).disponible} venta(s)
+                      </span>
+                    ) : (
+                      <input type="number" className={inputSm} value={p.stock}
+                        onChange={(e) => updateProducto(p.id, 'stock', Number(e.target.value))} />
+                    )}
                   </td>
                   <td className="px-4 py-2.5 text-center">
                     <Badge tone={mB2c >= 40 ? 'emerald' : mB2c >= 20 ? 'amber' : 'rose'}>{mB2c.toFixed(1)}%</Badge>
@@ -1155,6 +1329,7 @@ function ProductosPage() {
         </table>
       </Card>
 
+      <UnirProductosCard />
       <CalculadoraMargen productos={productos} />
       <NuevoProductoModal open={open} onClose={() => setOpen(false)} />
     </div>
@@ -1167,7 +1342,7 @@ function ProductosPage() {
 function POSPage() {
   const { productos, contactos, registrarVentaCarrito, comisionDe } = useData();
   const [canal, setCanal] = useState('B2C');
-  const [cart, setCart] = useState([]); // { producto_id, cantidad }
+  const [cart, setCart] = useState([]); // { clave, producto_id, cantidad, precio? }
   const [metodoPago, setMetodoPago] = useState('Efectivo');
   const [contactoId, setContactoId] = useState('');
   const [fecha, setFecha] = useState(todayISO());
@@ -1184,27 +1359,46 @@ function POSPage() {
   // El catálogo visible se filtra por el canal objetivo del producto (o "Todos").
   const productosDelCanal = productos.filter((p) => (p.canal_objetivo || 'Todos') === canal || p.canal_objetivo === 'Todos');
 
-  const agregarAlCarrito = (producto) => {
+  // ¿Alcanza el stock (propio o compartido) para sumar una unidad más de este
+  // producto, teniendo en cuenta todo lo que ya está en el carrito?
+  const hayStockPara = (producto, carrito) => {
+    const f = fuenteStock(productos, producto);
+    const stockBase = Number((f.base || producto).stock) || 0;
+    const usado = carrito.reduce((s, i) => {
+      const fi = fuenteStock(productos, i.producto_id);
+      return fi.id === f.id ? s + i.cantidad * fi.factor : s;
+    }, 0);
+    return usado + f.factor <= stockBase;
+  };
+
+  // precio: precio alternativo elegido en el POS (null = precio normal del canal).
+  // Cada combinación producto + precio es una línea distinta del carrito.
+  const agregarAlCarrito = (producto, precio = null) => {
+    const clave = `${producto.id}|${precio ?? ''}`;
     setCart((prev) => {
-      const existente = prev.find((i) => i.producto_id === producto.id);
-      const enCarrito = existente ? existente.cantidad : 0;
-      if (enCarrito >= producto.stock) return prev;
-      if (existente) return prev.map((i) => (i.producto_id === producto.id ? { ...i, cantidad: i.cantidad + 1 } : i));
-      return [...prev, { producto_id: producto.id, cantidad: 1 }];
+      if (!hayStockPara(producto, prev)) return prev;
+      const existente = prev.find((i) => i.clave === clave);
+      if (existente) return prev.map((i) => (i.clave === clave ? { ...i, cantidad: i.cantidad + 1 } : i));
+      return [...prev, { clave, producto_id: producto.id, cantidad: 1, ...(precio != null ? { precio } : {}) }];
     });
   };
 
-  const cambiarCantidad = (producto_id, delta) => {
-    setCart((prev) =>
-      prev
-        .map((i) => (i.producto_id === producto_id ? { ...i, cantidad: i.cantidad + delta } : i))
-        .filter((i) => i.cantidad > 0)
-    );
+  const cambiarCantidad = (clave, delta) => {
+    setCart((prev) => {
+      const linea = prev.find((i) => i.clave === clave);
+      if (delta > 0 && linea) {
+        const prod = productos.find((p) => p.id === linea.producto_id);
+        if (prod && !hayStockPara(prod, prev)) return prev;
+      }
+      return prev
+        .map((i) => (i.clave === clave ? { ...i, cantidad: i.cantidad + delta } : i))
+        .filter((i) => i.cantidad > 0);
+    });
   };
 
   const items = cart.map((i) => {
     const p = productos.find((pr) => pr.id === i.producto_id);
-    const precio = precioDe(p);
+    const precio = i.precio != null ? i.precio : precioDe(p);
     return { ...i, producto: p, precio, subtotal: precio * i.cantidad, costo: p.costo_variable * i.cantidad };
   });
 
@@ -1257,7 +1451,26 @@ function POSPage() {
         {/* Grilla de productos táctil */}
         <div className="lg:col-span-2 grid grid-cols-2 sm:grid-cols-3 gap-3">
           {productosDelCanal.map((p) => {
-            const sinStock = p.stock <= 0;
+            const st = stockDisponible(productos, p);
+            const sinStock = st.disponible <= 0;
+            const extras = (p.precios_extra || []).filter((pr) => pr && pr !== precioDe(p));
+            if (extras.length > 0) {
+              // Producto con varios precios: un botón por precio, mismo stock.
+              return (
+                <div key={p.id} className={`p-4 rounded-xl border ${sinStock ? 'bg-slate-50 border-slate-200 opacity-50' : 'bg-white border-slate-200 shadow-sm'}`}>
+                  <div className="font-medium text-slate-800 text-sm mb-2">{p.nombre}</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {[precioDe(p), ...extras].map((pr, idx) => (
+                      <button key={pr} disabled={sinStock} onClick={() => agregarAlCarrito(p, idx === 0 ? null : pr)}
+                        className="px-2.5 py-1.5 rounded-lg border border-emerald-300 bg-emerald-50 text-emerald-800 text-sm font-bold tabular-nums hover:bg-emerald-100 active:scale-[0.97] disabled:cursor-not-allowed">
+                        {formatGs(pr)}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="text-xs text-slate-400 mt-2">Stock: {st.stockBase}</div>
+                </div>
+              );
+            }
             return (
               <button key={p.id} onClick={() => agregarAlCarrito(p)} disabled={sinStock}
                 className={`text-left p-4 rounded-xl border transition-all ${
@@ -1267,7 +1480,9 @@ function POSPage() {
                 }`}>
                 <div className="font-medium text-slate-800 text-sm mb-2">{p.nombre}</div>
                 <div className="text-lg font-bold text-emerald-700 tabular-nums">{formatGs(precioDe(p))}</div>
-                <div className="text-xs text-slate-400 mt-1">Stock: {p.stock}</div>
+                <div className="text-xs text-slate-400 mt-1">
+                  {st.base ? `Stock: ${st.stockBase} ${st.base.nombre}${st.factor > 1 ? ` (${st.disponible} venta/s)` : ''}` : `Stock: ${p.stock}`}
+                </div>
               </button>
             );
           })}
@@ -1283,15 +1498,15 @@ function POSPage() {
           <h3 className="text-sm font-semibold text-slate-700 mb-3">Carrito · {canal}</h3>
           <div className="space-y-2 mb-4 max-h-64 overflow-y-auto">
             {items.map((i) => (
-              <div key={i.producto_id} className="flex items-center justify-between text-sm border-b border-slate-100 pb-2">
+              <div key={i.clave} className="flex items-center justify-between text-sm border-b border-slate-100 pb-2">
                 <div>
                   <div className="font-medium text-slate-700">{i.producto.nombre}</div>
                   <div className="text-xs text-slate-400 tabular-nums">{formatGs(i.precio)} c/u</div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <button onClick={() => cambiarCantidad(i.producto_id, -1)} className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center text-slate-600 hover:bg-slate-200"><Minus size={13} /></button>
+                  <button onClick={() => cambiarCantidad(i.clave, -1)} className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center text-slate-600 hover:bg-slate-200"><Minus size={13} /></button>
                   <span className="w-5 text-center tabular-nums">{i.cantidad}</span>
-                  <button onClick={() => cambiarCantidad(i.producto_id, 1)} className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center text-slate-600 hover:bg-slate-200"><Plus size={13} /></button>
+                  <button onClick={() => cambiarCantidad(i.clave, 1)} className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center text-slate-600 hover:bg-slate-200"><Plus size={13} /></button>
                 </div>
               </div>
             ))}
@@ -1393,6 +1608,7 @@ function HistorialVentasTab() {
               <th className="text-left px-4 py-2.5">Canal</th>
               <th className="text-left px-4 py-2.5">Producto</th>
               <th className="text-right px-4 py-2.5">Cantidad</th>
+              <th className="text-right px-4 py-2.5">Precio</th>
               <th className="text-right px-4 py-2.5">Total</th>
               <th className="text-left px-4 py-2.5">Pago</th>
               <th className="px-4 py-2.5"></th>
@@ -1421,6 +1637,18 @@ function HistorialVentasTab() {
                   <input type="number" min="1" className={inputSm} value={v.cantidad}
                     onChange={(e) => updateVenta(v.id, { cantidad: Number(e.target.value) })} />
                 </td>
+                <td className="px-4 py-2.5 text-right">
+                  {(() => {
+                    const prod = productos.find((p) => p.id === v.producto_id);
+                    const opciones = prod ? [...new Set([prod.precio_b2c, prod.precio_b2b, ...(prod.precios_extra || []), v.precio_unitario])].filter(Boolean).sort((x, y) => x - y) : [];
+                    return opciones.length > 1 ? (
+                      <select className={`${inputTableText} text-right tabular-nums`} value={v.precio_unitario}
+                        onChange={(e) => updateVenta(v.id, { precio_unitario: Number(e.target.value) })}>
+                        {opciones.map((pr) => <option key={pr} value={pr}>{formatGs(pr)}</option>)}
+                      </select>
+                    ) : <span className="tabular-nums text-slate-500">{formatGs(v.precio_unitario)}</span>;
+                  })()}
+                </td>
                 <td className="px-4 py-2.5 text-right tabular-nums font-semibold">{formatGs(v.total)}</td>
                 <td className="px-4 py-2.5">
                   <Badge tone={v.metodo_pago === 'Crédito' ? 'amber' : 'slate'}>{v.metodo_pago}</Badge>
@@ -1433,7 +1661,7 @@ function HistorialVentasTab() {
               </tr>
             ))}
             {filtradas.length === 0 && (
-              <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">No hay ventas registradas en este período.</td></tr>
+              <tr><td colSpan={8} className="px-4 py-8 text-center text-slate-400">No hay ventas registradas en este período.</td></tr>
             )}
           </tbody>
         </table>
@@ -1452,15 +1680,55 @@ function formatMesLabel(mk) {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
+
+// ---------- Stock compartido ----------
+// Un producto puede vender desde el stock de OTRO producto (stock_base_id),
+// consumiendo N unidades por cada venta (unidades_stock; ej. 2 en "2 por 50.000").
+// Así "Coco 25.000", "2 por 50.000" y "Coco 30.000" descuentan de un único stock
+// de cocos, que es el que se carga con las compras.
+function baseDeStock(productos, prod) {
+  if (!prod || !prod.stock_base_id || prod.stock_base_id === prod.id) return null;
+  const base = productos.find((p) => p.id === prod.stock_base_id);
+  return base && !base.stock_base_id ? base : null; // sin cadenas
+}
+// De dónde sale el stock de un producto y cuántas unidades consume por venta.
+function fuenteStock(productos, prodOrId) {
+  const prod = typeof prodOrId === 'object' ? prodOrId : productos.find((p) => p.id === prodOrId);
+  if (!prod) return { id: prodOrId, factor: 1, base: null };
+  const base = baseDeStock(productos, prod);
+  return base
+    ? { id: base.id, factor: Math.max(1, Number(prod.unidades_stock) || 1), base }
+    : { id: prod.id, factor: 1, base: null };
+}
+// Unidades de stock que consumió una venta. Las ventas nuevas guardan
+// stock_id/unidades_stock; las viejas descuentan de su propio producto.
+function consumoDeVenta(v) {
+  return v.stock_id != null
+    ? { id: v.stock_id, unidades: Number(v.unidades_stock) || 0 }
+    : { id: v.producto_id, unidades: Number(v.cantidad) || 0 };
+}
+// Cuántas ventas de este producto alcanzan con el stock disponible.
+function stockDisponible(productos, prod) {
+  const f = fuenteStock(productos, prod);
+  const stockBase = Number((f.base || prod).stock) || 0;
+  return { disponible: Math.floor(stockBase / f.factor), stockBase, factor: f.factor, base: f.base };
+}
+
 function resumenStock(productos, compras, ventas) {
-  return productos.map((p) => ({
-    id: p.id,
-    nombre: p.nombre,
-    categoria: p.categoria || '',
-    stock: Number(p.stock) || 0,
-    comprado: compras.filter((c) => c.producto_id === p.id).reduce((s, c) => s + c.cantidad, 0),
-    vendido: ventas.filter((v) => v.producto_id === p.id).reduce((s, v) => s + v.cantidad, 0),
-  }));
+  // Solo los productos que tienen stock propio. Los que "usan el stock de"
+  // otro producto se muestran como parte de ese stock compartido.
+  return productos.filter((p) => !baseDeStock(productos, p)).map((p) => {
+    const vinculados = productos.filter((x) => baseDeStock(productos, x)?.id === p.id);
+    return {
+      id: p.id,
+      nombre: p.nombre,
+      categoria: p.categoria || '',
+      stock: Number(p.stock) || 0,
+      comprado: compras.filter((c) => c.producto_id === p.id).reduce((s, c) => s + c.cantidad, 0),
+      vendido: ventas.filter((v) => consumoDeVenta(v).id === p.id).reduce((s, v) => s + consumoDeVenta(v).unidades, 0),
+      vinculados: vinculados.map((x) => `${x.nombre}${(Number(x.unidades_stock) || 1) > 1 ? ` (×${x.unidades_stock})` : ''}`),
+    };
+  });
 }
 
 function RegistrarCompraForm() {
@@ -1535,7 +1803,7 @@ function RegistrarCompraForm() {
           <Field label="Suma al stock de (opcional)">
             <select className={inputCls} value={form.productoId} onChange={(e) => setForm({ ...form, productoId: e.target.value })}>
               <option value="">No afecta stock del catálogo (insumo suelto)</option>
-              {productos.map((p) => <option key={p.id} value={p.id}>{p.nombre} (stock actual: {p.stock})</option>)}
+              {productos.filter((p) => !baseDeStock(productos, p)).map((p) => <option key={p.id} value={p.id}>{p.nombre} (stock actual: {p.stock})</option>)}
             </select>
           </Field>
           <div className="flex items-center justify-between pt-2 border-t border-slate-200">
@@ -1621,7 +1889,7 @@ function HistorialComprasTab() {
                   <select className={inputTableText} value={c.producto_id || ''}
                     onChange={(e) => updateCompra(c.id, { producto_id: e.target.value ? Number(e.target.value) : null })}>
                     <option value="">— sin stock —</option>
-                    {productos.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                    {productos.filter((p) => !baseDeStock(productos, p) || p.id === c.producto_id).map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}
                   </select>
                 </td>
                 <td className="px-4 py-2.5 text-right">
@@ -1659,7 +1927,7 @@ function ControlStockCard() {
         <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
           <Package size={16} className="text-emerald-700" /> Control de Stock
         </h3>
-        <p className="text-xs text-slate-400 mt-1">Stock actual = lo cargado a mano + compras asociadas − ventas. Las compras suman y las ventas descuentan automáticamente.</p>
+        <p className="text-xs text-slate-400 mt-1">Stock actual = lo cargado a mano + compras asociadas − ventas. Las compras suman y las ventas descuentan automáticamente. Los productos que comparten stock aparecen debajo de su stock base.</p>
       </div>
       <table className="w-full text-sm">
         <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
@@ -1674,7 +1942,10 @@ function ControlStockCard() {
         <tbody>
           {filas.map((f) => (
             <tr key={f.id} className="border-t border-slate-100">
-              <td className="px-4 py-2.5">{f.nombre}</td>
+              <td className="px-4 py-2.5">
+                {f.nombre}
+                {f.vinculados.length > 0 && <div className="text-xs text-slate-400">También venden de acá: {f.vinculados.join(', ')}</div>}
+              </td>
               <td className="px-4 py-2.5 text-right tabular-nums">{f.comprado}</td>
               <td className="px-4 py-2.5 text-right tabular-nums">{f.vendido}</td>
               <td className="px-4 py-2.5 text-right tabular-nums font-semibold">{f.stock}</td>
@@ -2328,7 +2599,7 @@ function ReportesPage() {
     });
 
     const hojaStock = resumenStock(productos, compras, ventas).map((f) => ({
-      Producto: f.nombre, Categoría: f.categoria, 'Stock Actual': f.stock, Comprado: f.comprado, Vendido: f.vendido,
+      Producto: f.nombre, Categoría: f.categoria, 'Stock Actual': f.stock, Comprado: f.comprado, Vendido: f.vendido, 'Comparten este stock': f.vinculados.join(', '),
     }));
     const hojaPersonal = [...pagosPersonal].sort((a, b) => (a.fecha < b.fecha ? -1 : 1)).map((p) => ({
       Fecha: p.fecha, Empleado: p.empleado, Concepto: p.concepto, Período: p.periodo || '', 'Medio de Pago': p.metodo_pago || '', Monto: p.monto, Nota: p.nota || '',
@@ -3177,6 +3448,8 @@ function AjustesPage() {
     costoInsumoBase: config.costoInsumoBase,
   });
   const [comisiones, setComisiones] = useState({ ...config.comisiones });
+  const [comisionesActivas, setComisionesActivas] = useState(Boolean(config.comisionesActivas));
+  const comisionesRegistradas = movimientos.filter((m) => m.comision_venta);
   const [mensaje, setMensaje] = useState('');
   const fileInputRef = useRef(null);
 
@@ -3187,6 +3460,7 @@ function AjustesPage() {
       cajaInicial: Number(form.cajaInicial),
       costoInsumoBase: Number(form.costoInsumoBase),
       comisiones: Object.fromEntries(METODOS_PAGO.map((m) => [m, Number(comisiones[m]) || 0])),
+      comisionesActivas,
     });
     setMensaje('Parámetros del negocio actualizados correctamente.');
     setTimeout(() => setMensaje(''), 3000);
@@ -3249,9 +3523,20 @@ function AjustesPage() {
           </Field>
         </div>
         <div className="pt-2 border-t border-slate-200">
-          <h4 className="text-xs font-semibold text-slate-600 mb-1">Comisiones por medio de pago (%)</h4>
-          <p className="text-xs text-slate-400 mb-3">Lo que te descuenta el posnet o la billetera por cada cobro. Se registra automáticamente como egreso "Comisión Medio de Pago" al confirmar la venta.</p>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="flex items-center justify-between gap-3 mb-1">
+            <h4 className="text-xs font-semibold text-slate-600">Comisiones por medio de pago (%)</h4>
+            <label className="flex items-center gap-2 text-xs font-medium cursor-pointer select-none">
+              <span className={comisionesActivas ? 'text-emerald-700' : 'text-slate-400'}>{comisionesActivas ? 'Activadas' : 'Desactivadas'}</span>
+              <button type="button" onClick={() => setComisionesActivas(!comisionesActivas)}
+                className={`relative w-10 h-5 rounded-full transition-colors ${comisionesActivas ? 'bg-emerald-600' : 'bg-slate-300'}`}>
+                <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all ${comisionesActivas ? 'left-5' : 'left-0.5'}`} />
+              </button>
+            </label>
+          </div>
+          <p className="text-xs text-slate-400 mb-3">
+            Lo que te descuenta el posnet o la billetera por cada cobro. Con el interruptor activado, se registra automáticamente como egreso "Comisión Medio de Pago" al confirmar cada venta. Desactivado, las ventas entran por su monto completo. El cambio aplica a las ventas nuevas al tocar "Guardar parámetros".
+          </p>
+          <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 ${comisionesActivas ? '' : 'opacity-50'}`}>
             {METODOS_PAGO.filter((m) => m !== 'Crédito').map((m) => (
               <Field key={m} label={m}>
                 <input type="number" step="0.1" min="0" className={inputCls} value={comisiones[m] ?? 0}
@@ -3259,6 +3544,20 @@ function AjustesPage() {
               </Field>
             ))}
           </div>
+          {comisionesRegistradas.length > 0 && (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+              <span className="text-xs text-amber-800">
+                Hay {comisionesRegistradas.length} comisión(es) ya registradas en Caja por {formatGs(comisionesRegistradas.reduce((t, m) => t + m.monto, 0))}.
+              </span>
+              <Button variant="secondary" onClick={() => {
+                if (window.confirm('¿Eliminar todas las comisiones de POS/QR que se registraron automáticamente? Las ventas no se tocan.')) {
+                  const n = data.borrarComisionesRegistradas();
+                  setMensaje(`Se eliminaron ${n} comisión(es) registradas.`);
+                  setTimeout(() => setMensaje(''), 3000);
+                }
+              }}><Trash2 size={13} /> Eliminar comisiones registradas</Button>
+            </div>
+          )}
         </div>
         <Button onClick={guardarConfig}>Guardar parámetros</Button>
       </Card>
